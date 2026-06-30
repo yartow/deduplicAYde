@@ -81,6 +81,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     for col, col_type in [
         ("local_timestamp", "TEXT"),
         ("local_timestamp_source", "TEXT"),
+        ("local_video_purged_at", "TEXT"),
     ]:
         if col not in existing:
             conn.execute(f"ALTER TABLE media_items ADD COLUMN {col} {col_type}")
@@ -167,6 +168,14 @@ def set_staged(conn: sqlite3.Connection, media_item_id: str, album_id: str) -> N
     conn.execute(
         "UPDATE media_items SET staged_album_id=?, staged_at=?, updated_at=? WHERE media_item_id=?",
         (album_id, now_iso(), now_iso(), media_item_id),
+    )
+
+
+def set_video_purged(conn: sqlite3.Connection, media_item_id: str) -> None:
+    """Null out local_path and record purge time for a locally-deleted video (cloud copy kept)."""
+    conn.execute(
+        "UPDATE media_items SET local_path=NULL, local_video_purged_at=?, updated_at=? WHERE media_item_id=?",
+        (now_iso(), now_iso(), media_item_id),
     )
 
 

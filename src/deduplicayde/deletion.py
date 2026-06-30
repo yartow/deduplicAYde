@@ -22,6 +22,7 @@ _PHOTOS_URL = "https://photos.google.com"
 _ALBUM_PURPOSE_MAP = {
     "receipts": "receipt",
     "vague": "vague",
+    "short-videos": "short_video",
 }
 
 _BATCH_SIZE = 100  # items to trash per browser session before pausing
@@ -55,6 +56,18 @@ def run(album: str, confirm: bool = False, dry_run: bool = True) -> None:
         resp = input().strip().lower()
         if resp != "y":
             print("Aborting. Review the album first.")
+            return
+
+    if purpose == "short_video":
+        print(
+            "\nIMPORTANT: Have you tested the Playwright deletion flow on a small test album first?\n"
+            "Per the runbook, the first Playwright run must be against a small album before\n"
+            "pointing it at a larger set. Proceed? [y/N] ",
+            end="",
+        )
+        resp = input().strip().lower()
+        if resp != "y":
+            print("Aborting.")
             return
 
     _run_playwright(purpose)
