@@ -1,0 +1,51 @@
+services:
+  cli:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.cli
+    volumes:
+      - "${DATA_DIR:-./data}:/data"
+      - "./secrets:/secrets"
+    environment:
+      - DATA_DIR=/data
+      - SECRETS_DIR=/secrets
+      - PYTHONUNBUFFERED=1
+      - BLUR_THRESHOLD=${BLUR_THRESHOLD:-100}
+      - EDGE_THRESHOLD=${EDGE_THRESHOLD:-0.05}
+      - OCR_DENSITY_THRESHOLD=${OCR_DENSITY_THRESHOLD:-0.001}
+      - PHASH_HAMMING_THRESHOLD=${PHASH_HAMMING_THRESHOLD:-10}
+    working_dir: /app
+    entrypoint: ["python", "-m", "deduplicayde.cli"]
+    command: ["status"]
+
+  delete:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.delete
+    volumes:
+      - "${DATA_DIR:-./data}:/data"
+      - "./secrets:/secrets"
+    ports:
+      - "6080:6080"
+    environment:
+      - DATA_DIR=/data
+      - SECRETS_DIR=/secrets
+      - PYTHONUNBUFFERED=1
+      - DISPLAY=:99
+    working_dir: /app
+    entrypoint: ["/app/docker/delete_entrypoint.sh"]
+    command: ["delete", "--help"]
+
+  review:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.review
+    volumes:
+      - "${DATA_DIR:-./data}:/data:ro"
+    ports:
+      - "8000:8000"
+    environment:
+      - DATA_DIR=/data
+      - PYTHONUNBUFFERED=1
+    working_dir: /app
+    entrypoint: ["python", "-m", "deduplicayde.review_app"]
