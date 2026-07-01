@@ -74,7 +74,13 @@ Claude Code finds simpler to set up reliably on macOS.
    desktop credentials, download `client_secret.json` into `secrets/` (gitignored).
 3. Plug in the external hard drive; set `DATA_DIR` in `.env` to its mount path.
 4. `docker compose build`
-5. `docker compose run cli round0` — builds the ID mapping for whatever is already
+5. As Google Takeout zip parts finish downloading into `~/Downloads`, run
+   `./scripts/extract_takeout.sh` to extract them into `DATA_DIR/library/` and
+   delete each zip after a verified successful extraction. Safe to re-run any
+   time — only processes zips still sitting in `~/Downloads`. Uses `ditto`
+   (not `unzip`) since Takeout's non-UTF8-flagged accented filenames trip up
+   Apple's `unzip`.
+6. `docker compose run cli round0` — builds the ID mapping for whatever is already
    matched/downloaded so far (re-run after each Takeout import).
 
 ## Running a round

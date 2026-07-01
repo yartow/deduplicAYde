@@ -307,9 +307,10 @@ def run(limit: int | None = None, refresh_catalog: bool = False) -> None:
         with db.get_conn() as conn:
             for item in all_items:
                 db.upsert_media_item(conn, item)
-        if not limit:
-            with db.get_conn() as conn:
-                db.mark_round_complete(conn, "round0_catalog")
+            # The rclone catalog fetch above is always run in full — `limit`
+            # only caps Phase B (local file matching) below — so the catalog
+            # cache is complete here regardless of `limit`.
+            db.mark_round_complete(conn, "round0_catalog")
 
     total = len(all_items)
 
