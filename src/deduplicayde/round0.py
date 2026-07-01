@@ -85,24 +85,65 @@ def _parse_exif_str(raw: str) -> str | None:
         return None
 
 
+def _read_sidecar_ts(sidecar: Path) -> str | None:
+    try:
+        with open(sidecar) as f:
+            data = json.load(f)
+        ts_str = data.get("photoTakenTime", {}).get("timestamp")
+        if ts_str:
+            dt = datetime.fromtimestamp(int(ts_str), tz=timezone.utc)
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        pass
+    return None
+
+
+_SIDECAR_TITLE_INDEX: dict[Path, dict[str, Path]] = {}
+
+
+def _sidecar_dir_index(directory: Path) -> dict[str, Path]:
+    """Map {lowercase original filename: sidecar path} for one directory.
+
+    Takeout truncates ".supplemental-metadata.json" when the combined path
+    would exceed its length limit (e.g. "...jpg.supplemental-metada.json"),
+    so filename-guessing misses those. Every sidecar's JSON body still carries
+    the untruncated original filename in "title", so scan once per directory
+    and index by that instead.
+    """
+    if directory in _SIDECAR_TITLE_INDEX:
+        return _SIDECAR_TITLE_INDEX[directory]
+    index: dict[str, Path] = {}
+    for jf in directory.glob("*.json"):
+        try:
+            with open(jf) as f:
+                data = json.load(f)
+            title = data.get("title")
+            if title:
+                index[title.lower()] = jf
+        except Exception:
+            continue
+    _SIDECAR_TITLE_INDEX[directory] = index
+    return index
+
+
 def _sidecar_timestamp(path: Path) -> str | None:
     """Return photoTakenTime from a Takeout JSON sidecar as ISO UTC, or None.
 
     Takeout places sidecar files alongside the media file, using either
-    "photo.jpg.json" or (for long filenames) "photo.json".
+    "photo.jpg.json" or (for long filenames) "photo.json" — or, when the
+    ".supplemental-metadata.json" suffix itself is too long, a truncated
+    name that has to be matched via the sidecar's internal "title" field.
     """
     for sidecar in (path.with_name(path.name + ".json"), path.with_suffix(".json")):
-        if not sidecar.exists():
-            continue
-        try:
-            with open(sidecar) as f:
-                data = json.load(f)
-            ts_str = data.get("photoTakenTime", {}).get("timestamp")
-            if ts_str:
-                dt = datetime.fromtimestamp(int(ts_str), tz=timezone.utc)
-                return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        except Exception:
-            pass
+        if sidecar.exists():
+            ts = _read_sidecar_ts(sidecar)
+            if ts:
+                return ts
+
+    sidecar = _sidecar_dir_index(path.parent).get(path.name.lower())
+    if sidecar:
+        return _read_sidecar_ts(sidecar)
+
     return None
 
 
