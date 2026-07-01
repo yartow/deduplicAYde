@@ -239,20 +239,44 @@ def _phash_tiebreak(
 # Main
 # ---------------------------------------------------------------------------
 
-def run(limit: int | None = None) -> None:
+def run(limit: int | None = None, refresh_catalog: bool = False) -> None:
     db.init_db()
     log_info(_ROUND, "Starting Round 0: building ID mapping")
 
+    # --- Phase A: catalog fetch (rclone) or load from DB cache ---
+    with db.get_conn() as conn:
+        cat_row = conn.execute(
+            "SELECT completed_at FROM round_progress WHERE round_name='round0_catalog'"
+        ).fetchone()
+    catalog_ready = cat_row and cat_row["completed_at"]
+
+    if catalog_ready and not refresh_catalog:
+        print("Catalog already in DB — skipping rclone fetch.")
+        print("(Use --refresh-catalog to re-fetch from Google Photos.)")
+        with db.get_conn() as conn:
+            all_items = db.get_catalog_items(conn)
+        log_info(_ROUND, "Using cached catalog", item_count=len(all_items))
+        print(f"Catalog: {len(all_items)} items loaded from DB.")
+    else:
+        print("Fetching full library from rclone (may take a few minutes for large libraries)…")
+        all_items = list(rclone_api.iter_media_items())
+        log_info(_ROUND, "rclone listing complete", total=len(all_items))
+        print(f"rclone returned {len(all_items)} items.")
+        # Persist all items to DB before matching begins
+        with db.get_conn() as conn:
+            for item in all_items:
+                db.upsert_media_item(conn, item)
+        if not limit:
+            with db.get_conn() as conn:
+                db.mark_round_complete(conn, "round0_catalog")
+
+    total = len(all_items)
+
+    # --- Phase B: local file matching ---
     local_index = _index_local_files()
     local_file_count = sum(len(v) for v in local_index.values())
     log_info(_ROUND, "Local file index ready", file_count=local_file_count)
     print(f"Local files indexed: {local_file_count}")
-
-    print("Fetching full library from rclone (may take a few minutes for large libraries)…")
-    all_items = list(rclone_api.iter_media_items())
-    total = len(all_items)
-    print(f"rclone returned {total} items.")
-    log_info(_ROUND, "rclone listing complete", total=total)
 
     processed = 0
     matched = 0
@@ -275,8 +299,6 @@ def run(limit: int | None = None) -> None:
                     skipped += 1
                     bar.update(1)
                     continue
-
-                db.upsert_media_item(conn, item)
 
                 candidates = local_index.get(filename.lower(), [])
 

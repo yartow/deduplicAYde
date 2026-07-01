@@ -171,6 +171,22 @@ def set_staged(conn: sqlite3.Connection, media_item_id: str, album_id: str) -> N
     )
 
 
+def get_catalog_items(conn: sqlite3.Connection) -> list[dict]:
+    """Return all media_items as API-shaped dicts for round0 local matching."""
+    rows = conn.execute(
+        "SELECT media_item_id, filename, creation_time, mime_type FROM media_items"
+    ).fetchall()
+    return [
+        {
+            "id": r["media_item_id"],
+            "filename": r["filename"],
+            "mediaMetadata": {"creationTime": r["creation_time"]},
+            "mimeType": r["mime_type"],
+        }
+        for r in rows
+    ]
+
+
 def set_video_purged(conn: sqlite3.Connection, media_item_id: str) -> None:
     """Null out local_path and record purge time for a locally-deleted video (cloud copy kept)."""
     conn.execute(

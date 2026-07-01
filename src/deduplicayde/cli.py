@@ -48,7 +48,7 @@ def cmd_rclone_setup(_args) -> None:
 
 def cmd_round0(args) -> None:
     from . import round0
-    round0.run(limit=args.limit)
+    round0.run(limit=args.limit, refresh_catalog=args.refresh_catalog)
 
 
 def cmd_round1(args) -> None:
@@ -168,7 +168,9 @@ def main() -> None:
 
     # round0
     p0 = sub.add_parser("round0", help="Build API <-> local file mapping")
-    p0.add_argument("--limit", type=int, default=None, help="Stop after N API items (testing)")
+    p0.add_argument("--limit", type=int, default=None, help="Stop after N items (testing)")
+    p0.add_argument("--refresh-catalog", action="store_true", default=False,
+                    help="Force re-fetch from Google Photos even if catalog is already cached")
 
     # round1
     p1 = sub.add_parser("round1", help="Detect + stage items (first half)")
