@@ -54,10 +54,9 @@ def run(threshold: int | None = None) -> None:
     with db.get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT media_item_id, local_path
+            SELECT id, local_path
             FROM media_items
-            WHERE local_path IS NOT NULL
-              AND phash IS NULL
+            WHERE phash IS NULL
               AND deletion_status IS NULL
               AND (label IS NULL OR label = 'ok')
             """
@@ -76,8 +75,8 @@ def run(threshold: int | None = None) -> None:
             if phash:
                 with db.get_conn() as conn:
                     conn.execute(
-                        "UPDATE media_items SET phash=?, updated_at=? WHERE media_item_id=?",
-                        (phash, db.now_iso(), row["media_item_id"]),
+                        "UPDATE media_items SET phash=?, updated_at=? WHERE id=?",
+                        (phash, db.now_iso(), row["id"]),
                     )
             bar.update(1)
 
@@ -85,7 +84,7 @@ def run(threshold: int | None = None) -> None:
     with db.get_conn() as conn:
         all_items = conn.execute(
             """
-            SELECT media_item_id, local_path, phash
+            SELECT id, local_path, phash
             FROM media_items
             WHERE phash IS NOT NULL
               AND deletion_status IS NULL
@@ -103,7 +102,7 @@ def run(threshold: int | None = None) -> None:
     # Compare all pairs — O(n²) but fine for typical library sizes after filtering
     new_pairs = 0
     items = list(all_items)
-    hashes = [(row["media_item_id"], imagehash.hex_to_hash(row["phash"]), row["local_path"])
+    hashes = [(row["id"], imagehash.hex_to_hash(row["phash"]), row["local_path"])
               for row in items]
 
     with tqdm(total=len(hashes) * (len(hashes) - 1) // 2, desc="Finding pairs", unit=" pairs") as bar:

@@ -1,18 +1,21 @@
-"""Round 3: Reconcile the API state against local files.
+"""Round 3: Mirror confirmed cloud deletions to local files.
 
-After deletions in Google Photos, re-pull the full mediaItems list and diff
-it against state.db to find what was actually removed.  Mirror those deletions
-locally (move to trash or log them), *except* files already in /data/receipts/.
+deletion.py already writes deletion_status='deleted' the moment a Playwright
+trash action succeeds — that write IS the authoritative record of what's
+actually been removed from Google Photos, so there's nothing left to
+reconcile against the cloud (the API can't enumerate the library to diff
+against anyway — see CLAUDE.md). Round 3 is now a fast, local-only pass:
+delete the local copy for anything already marked deleted, except files
+under /data/receipts/, which are permanent and never touched here.
 
 Run:
     docker compose run cli round3 --dry-run
     docker compose run cli round3
 """
 import os
-import shutil
 from pathlib import Path
 
-from . import db, rclone_api
+from . import db
 from .logger import log_info, log_item, log_error
 
 _DATA_DIR = os.environ.get("DATA_DIR", "/data")
@@ -22,94 +25,59 @@ _ROUND = "round3"
 
 def run(dry_run: bool = True) -> None:
     db.init_db()
-    log_info(_ROUND, "Starting Round 3: cloud/local reconciliation", dry_run=dry_run)
+    log_info(_ROUND, "Starting Round 3: local cleanup of confirmed cloud deletions", dry_run=dry_run)
 
-    # Re-pull all current IDs via rclone
-    print("Fetching current library via rclone (may take a few minutes)…")
-    live_ids: set[str] = rclone_api.list_all_media_item_ids()
-    log_info(_ROUND, "Live IDs fetched via rclone", count=len(live_ids))
-
-    # Find items in our DB that no longer exist in the API (deleted in Photos)
     with db.get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT media_item_id, filename, local_path, label, deletion_status
+            SELECT id, filename, local_path
             FROM media_items
-            WHERE local_path IS NOT NULL AND deletion_status IS NULL
+            WHERE deletion_status='deleted' AND local_path IS NOT NULL
             """
         ).fetchall()
 
-    confirmed_deleted = []
-    for row in rows:
-        if row["media_item_id"] not in live_ids:
-            confirmed_deleted.append(dict(row))
+    log_info(_ROUND, "Confirmed-deleted rows found", count=len(rows))
 
-    log_info(_ROUND, "Items confirmed deleted in Photos", count=len(confirmed_deleted))
-
-    if not confirmed_deleted:
-        print("No local files to sync — nothing was deleted in Google Photos since last run.")
+    if not rows:
+        print("Nothing to do — no items marked deleted since last run.")
         return
 
-    # Mirror deletions locally
-    moved = 0
+    deleted_locally = 0
+    already_gone = 0
     skipped_receipts = 0
     errors = 0
 
-    for item in confirmed_deleted:
-        local_path = Path(item["local_path"])
+    for row in rows:
+        local_path = Path(row["local_path"])
 
-        # Never touch the receipts folder
+        # Never touch the receipts folder — permanent, excluded from this sync.
         try:
             local_path.resolve().relative_to(_RECEIPTS_DIR.resolve())
-            log_item(
-                _ROUND, "skipped_receipts_dir",
-                media_item_id=item["media_item_id"],
-                path=str(local_path),
-            )
+            log_item(_ROUND, "skipped_receipts_dir", item_id=row["id"], path=str(local_path))
             skipped_receipts += 1
-            # Still mark as deleted in DB so we know
-            if not dry_run:
-                with db.get_conn() as conn:
-                    db.set_deleted(conn, item["media_item_id"])
             continue
         except ValueError:
-            pass  # Not under receipts dir — proceed
+            pass  # not under receipts dir — proceed
 
         if not local_path.exists():
-            log_item(
-                _ROUND, "already_gone",
-                media_item_id=item["media_item_id"],
-                path=str(local_path),
-            )
-            if not dry_run:
-                with db.get_conn() as conn:
-                    db.set_deleted(conn, item["media_item_id"])
+            log_item(_ROUND, "already_gone", item_id=row["id"], path=str(local_path))
+            already_gone += 1
             continue
 
         if dry_run:
             log_item(
                 _ROUND, "would_delete_local",
-                media_item_id=item["media_item_id"],
-                path=str(local_path),
-                filename=item["filename"],
+                item_id=row["id"], path=str(local_path), filename=row["filename"],
             )
         else:
             try:
                 local_path.unlink()
-                log_item(
-                    _ROUND, "deleted_local",
-                    media_item_id=item["media_item_id"],
-                    path=str(local_path),
-                )
-                with db.get_conn() as conn:
-                    db.set_deleted(conn, item["media_item_id"])
-                moved += 1
+                log_item(_ROUND, "deleted_local", item_id=row["id"], path=str(local_path))
+                deleted_locally += 1
             except OSError as e:
                 log_error(
                     _ROUND, "delete_failed",
-                    media_item_id=item["media_item_id"],
-                    path=str(local_path),
-                    error=str(e),
+                    item_id=row["id"], path=str(local_path), error=str(e),
                 )
                 errors += 1
 
@@ -118,12 +86,14 @@ def run(dry_run: bool = True) -> None:
             db.mark_round_complete(conn, _ROUND)
 
     dry_tag = "[DRY-RUN] " if dry_run else ""
-    print(f"\n{dry_tag}Round 3 reconciliation:")
-    print(f"  Confirmed deleted in Photos: {len(confirmed_deleted)}")
+    print(f"\n{dry_tag}Round 3 local cleanup:")
+    print(f"  Confirmed deleted in Photos: {len(rows)}")
     print(f"  Skipped (in receipts dir):   {skipped_receipts}")
+    print(f"  Already gone locally:        {already_gone}")
     if dry_run:
-        print(f"  Would delete locally:        {len(confirmed_deleted) - skipped_receipts}")
+        to_delete = len(rows) - skipped_receipts - already_gone
+        print(f"  Would delete locally:        {to_delete}")
         print("\nRe-run without --dry-run to delete local copies.")
     else:
-        print(f"  Deleted locally:             {moved}")
+        print(f"  Deleted locally:             {deleted_locally}")
         print(f"  Errors:                      {errors}")

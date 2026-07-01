@@ -11,10 +11,18 @@ overall design; this file covers implementation conventions and guardrails.
   text-density detection.
 - **imagehash** (phash) for duplicate detection.
 - **google-api-python-client** + **google-auth-oauthlib** for the Photos Library API
-  (mapping, search, album staging — never for deletion, since no delete endpoint
-  exists).
-- **Playwright (Python)** for the one piece that needs real browser automation:
-  actually trashing items via photos.google.com.
+  — **album creation only**. Google's March 2024 policy change restricts OAuth
+  tokens (even from rclone's pre-registered client) to `photoslibrary.readonly
+  .appcreateddata`: an app can only see/touch media items it uploaded itself, so
+  `mediaItems.list/search` can never enumerate an existing library and
+  `albums.batchAddMediaItems` can never be given a valid `mediaItemId` for a
+  pre-existing item. Creating a fresh, empty, app-owned album still works — that's
+  the only thing this API is used for now. See rule 1 below for what replaced the
+  rest.
+- **Playwright (Python)** for everything that needs to see or act on existing
+  library items: locating a flagged local file on photos.google.com, adding it to
+  a review album, and trashing staged items — all driven as the logged-in human
+  user, which isn't subject to the OAuth scope restriction above.
 - **SQLite** (stdlib `sqlite3`, or `sqlmodel`/`peewee` if a lightweight ORM helps)
   for all checkpoint/state tracking.
 - **FastAPI + a minimal HTML/JS frontend** (or Flask, whichever is faster to ship)
@@ -28,13 +36,18 @@ overall design; this file covers implementation conventions and guardrails.
 
 1. **Every round must be idempotent and resumable.** Before processing any item,
    check `state.db` for whether it's already been handled; never reprocess
-   completed work. Use a single source of truth schema (e.g. a `media_items` table
-   keyed by Google `mediaItemId`, with columns for local path, detection results,
-   staging status, review status, deletion status, timestamps).
-2. **No deletion via the Photos API.** Only `albums.batchAddMediaItems` (staging)
-   and read endpoints (`mediaItems.list/search`, `albums.get`) are used against the
-   API. The only code path that performs real deletion is the Playwright automation
-   against the actual web UI.
+   completed work. Use a single source of truth schema (a `media_items` table
+   keyed by an internal row id, identity anchored to the local file path — not a
+   Google `mediaItemId`, since one can no longer be obtained for pre-existing
+   items — with columns for detection results, staging status, review status,
+   deletion status, timestamps).
+2. **No deletion via the Photos API.** The only API call used against the Photos
+   Library API is album creation (`albums.insert`/find-by-title); it has no
+   delete endpoint and, per rule 1's OAuth restriction, can't add pre-existing
+   items to an album either. Locating items and adding them to a review album,
+   as well as actually trashing staged items, are both Playwright automation
+   against the real web UI — the only code paths that touch existing library
+   items at all.
 3. **Dry-run by default.** Any command with a destructive effect (staging into an
    album that will later be auto-deleted, triggering the Playwright delete flow,
    deleting local files) must require an explicit flag to actually execute, and
@@ -56,13 +69,28 @@ overall design; this file covers implementation conventions and guardrails.
 8. **Logging**: write structured logs (one line per item processed, with outcome)
    to `/data/logs/`, in addition to the SQLite state, so progress can be audited
    without querying the database.
+9. **Why there's no `mediaItemId` in the schema**: confirmed live against a real
+   account (traced raw HTTP request/response bodies to
+   `photoslibrary.googleapis.com` — every page came back with a valid
+   `nextPageToken` but zero `mediaItems`, with and without
+   `includeArchivedMedia`) that the OAuth scope granted for this app —
+   `photoslibrary.readonly.appcreateddata` — only exposes items the app itself
+   uploaded. This is Google's March 2024 API policy change, not an rclone/config
+   bug, and it applies regardless of which OAuth client is used (rclone's
+   pre-registered client is not exempt for fresh authorizations). Re-requesting
+   the broader `photoslibrary.readonly` scope is not a viable fix — Google isn't
+   granting it to personal-use OAuth consents. Don't attempt to re-add
+   cloud-side enumeration or ID-based staging without first re-verifying this
+   restriction still holds.
 
 ## Things to ask the user about before proceeding
 
 - Before first OAuth login / before any code touches real Google account
   credentials.
-- Before running the Playwright deletion flow for the first time, and before
-  pointing it at anything larger than a small test album.
+- Before running the Playwright locate/stage flow (`stage`) or deletion flow
+  (`delete`) for the first time, and before pointing either at anything larger
+  than a small test album — their DOM selectors are best-effort and unverified
+  against the live site until run once and watched via noVNC.
 - Before running `--delete-receipts` or any other non-dry-run flag against the
   full library for the first time.
 - Before installing any new system dependency that isn't already covered by the
@@ -84,19 +112,23 @@ overall design; this file covers implementation conventions and guardrails.
 
 1. Repo scaffolding, Docker Compose, `.env.example`, `secrets/` gitignored.
 2. SQLite schema + a `cli status` command (even before other rounds exist).
-3. Round 0: OAuth flow + `mediaItems.list` pagination + local file matching
-   (filename as the primary key; timestamp disambiguation when multiple local files
-   share the same name; phash as a final tiebreaker). **Never use filesystem
-   mtime/ctime** — Takeout extraction corrupts these. True timestamp priority:
-   (a) EXIF `DateTimeOriginal` via `exifread`, (b) `photoTakenTime` from the
-   Takeout JSON sidecar. Files with neither source are flagged `no_timestamp` in
-   the logs for manual review. -> populate `media_items` table.
-4. Round 1/2 detection (OpenCV blur/edge + Tesseract OCR) -> classification ->
-   staging via `albums.batchAddMediaItems`.
-5. Playwright deletion flow, tested first against a small manually-created test
+3. Round 0: local-only cataloging of everything under `DATA_DIR/library/`
+   (identity is the file path itself — no cloud enumeration is possible, see
+   tech-stack and rule 1 above). Resolve each file's true timestamp: (a) EXIF
+   `DateTimeOriginal` via `exifread`, (b) `photoTakenTime` from the Takeout JSON
+   sidecar. **Never use filesystem mtime/ctime** — Takeout extraction corrupts
+   these. Files with neither source are flagged `no_timestamp` in the logs for
+   manual review. -> populate `media_items` table.
+4. Round 1/2 detection (OpenCV blur/edge + Tesseract OCR) -> classification only,
+   no cloud interaction.
+5. Playwright locate + stage flow: given a flagged local file, find it on
+   photos.google.com (date + filename) and add it to a review album (created via
+   the API). Tested first against a small manually-created test album before
+   being wired into the receipts/vague flow, same as the deletion flow below.
+6. Playwright deletion flow, tested first against a small manually-created test
    album before being wired into the receipts/vague flow.
-6. Round 3 reconciliation diff + local deletion sync.
-7. Round 4 phash clustering + FastAPI/Flask review app.
+7. Round 3 local cleanup (mirror confirmed cloud deletions to local files) +
+   Round 4 phash clustering + FastAPI/Flask review app.
 
-Confirm Round 0 works end-to-end against the real account (read-only) before
-writing any code that stages or deletes anything.
+Confirm Round 0 works end-to-end against real local files before writing any
+code that stages or deletes anything.

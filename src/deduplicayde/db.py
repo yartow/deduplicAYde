@@ -5,23 +5,38 @@ from datetime import datetime, timezone
 
 DB_PATH = os.path.join(os.environ.get("DATA_DIR", "/data"), "state.db")
 
+# NOTE: Google's March 2024 Photos Library API policy change restricts OAuth
+# tokens (even rclone's pre-registered client) to `photoslibrary.readonly
+# .appcreateddata` — an app can only see media items it uploaded itself. Since
+# this app has never uploaded anything, the API can never enumerate the
+# existing library, so `media_items` can no longer be keyed on a Google
+# `mediaItemId` (there's no way to obtain one for a pre-existing item). Identity
+# is now anchored to the local file path instead; the cloud side is something
+# Playwright locates and acts on directly, never something read via the API.
+# The schema below is a one-time breaking cut (not an additive migration) —
+# safe because state.db had zero rows under the old schema at the time of the
+# rewrite.
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
 
 CREATE TABLE IF NOT EXISTS media_items (
-    media_item_id  TEXT PRIMARY KEY,
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    local_path     TEXT NOT NULL UNIQUE,
     filename       TEXT NOT NULL,
-    creation_time  TEXT,
-    mime_type      TEXT,
-    local_path     TEXT,
     file_size      INTEGER,
     phash          TEXT,
+    -- local file timestamp (never use mtime/ctime — Takeout corrupts these)
+    local_timestamp        TEXT,   -- resolved true timestamp (EXIF or sidecar)
+    local_timestamp_source TEXT,   -- exif | sidecar | none
+    -- best-effort cloud reference; the API can no longer be used to discover
+    -- this for pre-existing items, so it generally stays NULL
+    cloud_media_item_id TEXT,
     -- detection results
     blur_score     REAL,
     edge_density   REAL,
     ocr_text_density REAL,
     label          TEXT,    -- receipt | vague | ok | NULL (unprocessed)
-    -- staging
+    -- staging (Playwright-confirmed add-to-album)
     staged_album_id TEXT,
     staged_at       TEXT,
     -- manual review (for vague items)
@@ -30,9 +45,10 @@ CREATE TABLE IF NOT EXISTS media_items (
     -- deletion
     deleted_at      TEXT,
     deletion_status TEXT,   -- deleted | failed
-    -- local file timestamp (never use mtime/ctime — Takeout corrupts these)
-    local_timestamp        TEXT,   -- resolved true timestamp (EXIF or sidecar)
-    local_timestamp_source TEXT,   -- exif | sidecar | none
+    -- local-only video purge bookkeeping (cloud copy kept; local_path stays
+    -- populated as the row's identity even after the physical file is gone —
+    -- consumers already check path existence, not path presence)
+    local_video_purged_at TEXT,
     -- bookkeeping
     scanned_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
@@ -47,8 +63,8 @@ CREATE TABLE IF NOT EXISTS albums (
 
 CREATE TABLE IF NOT EXISTS duplicate_pairs (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    item_a_id        TEXT NOT NULL REFERENCES media_items(media_item_id),
-    item_b_id        TEXT NOT NULL REFERENCES media_items(media_item_id),
+    item_a_id        INTEGER NOT NULL REFERENCES media_items(id),
+    item_b_id        INTEGER NOT NULL REFERENCES media_items(id),
     hamming_distance INTEGER NOT NULL,
     review_status    TEXT NOT NULL DEFAULT 'pending',  -- pending | keep_a | keep_b | keep_both | skip
     reviewed_at      TEXT,
@@ -65,10 +81,24 @@ CREATE TABLE IF NOT EXISTS round_progress (
 );
 """
 
+# One-time breaking cut: the old media_items/duplicate_pairs shape (keyed on
+# Google mediaItemId) is incompatible with the new local-path-keyed shape.
+# Drop and recreate rather than ALTER, since there was no salvageable data
+# under the old schema. Safe to remove this block in a later commit once the
+# new schema has shipped.
+_DROP_LEGACY_SCHEMA = """
+DROP TABLE IF EXISTS duplicate_pairs;
+DROP TABLE IF EXISTS media_items;
+"""
+
 
 def init_db() -> None:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
+    existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(media_items)").fetchall()}
+    if "media_item_id" in existing_cols:
+        # Old cloud-ID-keyed schema found; drop it (see _DROP_LEGACY_SCHEMA docstring above).
+        conn.executescript(_DROP_LEGACY_SCHEMA)
     conn.executescript(_SCHEMA)
     _migrate(conn)
     conn.commit()
@@ -78,13 +108,10 @@ def init_db() -> None:
 def _migrate(conn: sqlite3.Connection) -> None:
     """Add columns introduced after the initial schema so existing DBs stay compatible."""
     existing = {r[1] for r in conn.execute("PRAGMA table_info(media_items)").fetchall()}
-    for col, col_type in [
-        ("local_timestamp", "TEXT"),
-        ("local_timestamp_source", "TEXT"),
-        ("local_video_purged_at", "TEXT"),
-    ]:
+    for col, col_type in []:
         if col not in existing:
             conn.execute(f"ALTER TABLE media_items ADD COLUMN {col} {col_type}")
+    _ = existing  # no pending additive migrations right now
 
 
 @contextmanager
@@ -106,50 +133,48 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def upsert_media_item(conn: sqlite3.Connection, api_item: dict) -> None:
-    """Insert or refresh a media item from an API response dict."""
-    meta = api_item.get("mediaMetadata", {})
+def upsert_local_item(
+    conn: sqlite3.Connection,
+    local_path: str,
+    filename: str,
+    file_size: int,
+    local_timestamp: str | None = None,
+    local_timestamp_source: str | None = None,
+    phash: str | None = None,
+) -> int:
+    """Insert or refresh a media item discovered on disk. Returns the row id."""
     conn.execute(
         """
-        INSERT INTO media_items (media_item_id, filename, creation_time, mime_type, updated_at)
-        VALUES (:id, :filename, :creation_time, :mime_type, :now)
-        ON CONFLICT(media_item_id) DO UPDATE SET
-            filename      = excluded.filename,
-            creation_time = excluded.creation_time,
-            mime_type     = excluded.mime_type,
-            updated_at    = excluded.updated_at
+        INSERT INTO media_items
+            (local_path, filename, file_size, local_timestamp, local_timestamp_source, phash, updated_at)
+        VALUES (:local_path, :filename, :file_size, :local_timestamp, :local_timestamp_source, :phash, :now)
+        ON CONFLICT(local_path) DO UPDATE SET
+            filename                = excluded.filename,
+            file_size               = excluded.file_size,
+            local_timestamp         = excluded.local_timestamp,
+            local_timestamp_source  = excluded.local_timestamp_source,
+            phash                   = COALESCE(excluded.phash, media_items.phash),
+            updated_at              = excluded.updated_at
         """,
         {
-            "id": api_item["id"],
-            "filename": api_item["filename"],
-            "creation_time": meta.get("creationTime"),
-            "mime_type": api_item.get("mimeType"),
+            "local_path": local_path,
+            "filename": filename,
+            "file_size": file_size,
+            "local_timestamp": local_timestamp,
+            "local_timestamp_source": local_timestamp_source,
+            "phash": phash,
             "now": now_iso(),
         },
     )
-
-
-def set_local_path(
-    conn: sqlite3.Connection,
-    media_item_id: str,
-    path: str,
-    size: int,
-    local_timestamp: str | None = None,
-    local_timestamp_source: str | None = None,
-) -> None:
-    conn.execute(
-        """UPDATE media_items SET
-               local_path=?, file_size=?,
-               local_timestamp=?, local_timestamp_source=?,
-               updated_at=?
-           WHERE media_item_id=?""",
-        (path, size, local_timestamp, local_timestamp_source, now_iso(), media_item_id),
-    )
+    row = conn.execute(
+        "SELECT id FROM media_items WHERE local_path=?", (local_path,)
+    ).fetchone()
+    return row["id"]
 
 
 def set_detection_result(
     conn: sqlite3.Connection,
-    media_item_id: str,
+    item_id: int,
     blur_score: float,
     edge_density: float,
     ocr_text_density: float,
@@ -159,46 +184,32 @@ def set_detection_result(
         """UPDATE media_items SET
             blur_score=?, edge_density=?, ocr_text_density=?,
             label=?, updated_at=?
-           WHERE media_item_id=?""",
-        (blur_score, edge_density, ocr_text_density, label, now_iso(), media_item_id),
+           WHERE id=?""",
+        (blur_score, edge_density, ocr_text_density, label, now_iso(), item_id),
     )
 
 
-def set_staged(conn: sqlite3.Connection, media_item_id: str, album_id: str) -> None:
+def set_staged(conn: sqlite3.Connection, item_id: int, album_id: str) -> None:
     conn.execute(
-        "UPDATE media_items SET staged_album_id=?, staged_at=?, updated_at=? WHERE media_item_id=?",
-        (album_id, now_iso(), now_iso(), media_item_id),
+        "UPDATE media_items SET staged_album_id=?, staged_at=?, updated_at=? WHERE id=?",
+        (album_id, now_iso(), now_iso(), item_id),
     )
 
 
-def get_catalog_items(conn: sqlite3.Connection) -> list[dict]:
-    """Return all media_items as API-shaped dicts for round0 local matching."""
-    rows = conn.execute(
-        "SELECT media_item_id, filename, creation_time, mime_type FROM media_items"
-    ).fetchall()
-    return [
-        {
-            "id": r["media_item_id"],
-            "filename": r["filename"],
-            "mediaMetadata": {"creationTime": r["creation_time"]},
-            "mimeType": r["mime_type"],
-        }
-        for r in rows
-    ]
-
-
-def set_video_purged(conn: sqlite3.Connection, media_item_id: str) -> None:
-    """Null out local_path and record purge time for a locally-deleted video (cloud copy kept)."""
+def set_video_purged(conn: sqlite3.Connection, item_id: int) -> None:
+    """Record purge time for a locally-deleted video (cloud copy kept). local_path
+    is left in place — it's the row's identity now, not just a pointer, and every
+    consumer already checks file existence rather than path presence."""
     conn.execute(
-        "UPDATE media_items SET local_path=NULL, local_video_purged_at=?, updated_at=? WHERE media_item_id=?",
-        (now_iso(), now_iso(), media_item_id),
+        "UPDATE media_items SET local_video_purged_at=?, updated_at=? WHERE id=?",
+        (now_iso(), now_iso(), item_id),
     )
 
 
-def set_deleted(conn: sqlite3.Connection, media_item_id: str, status: str = "deleted") -> None:
+def set_deleted(conn: sqlite3.Connection, item_id: int, status: str = "deleted") -> None:
     conn.execute(
-        "UPDATE media_items SET deleted_at=?, deletion_status=?, updated_at=? WHERE media_item_id=?",
-        (now_iso(), status, now_iso(), media_item_id),
+        "UPDATE media_items SET deleted_at=?, deletion_status=?, updated_at=? WHERE id=?",
+        (now_iso(), status, now_iso(), item_id),
     )
 
 

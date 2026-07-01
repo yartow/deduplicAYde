@@ -13,7 +13,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from . import auth, db, photos_api
+from . import auth, browser, db, photos_api
 from .logger import log_info, log_item, log_error
 
 _LIBRARY_DIR = Path(os.environ.get("DATA_DIR", "/data")) / "library"
@@ -49,7 +49,12 @@ def _ffprobe_duration(path: Path) -> float | None:
 
 
 def detect_short_videos(dry_run: bool = True, max_duration_secs: float = 3.0) -> None:
-    """Find local video files ≤ max_duration_secs, stage them in Google Photos, delete locally.
+    """Find local video files ≤ max_duration_secs, locate + stage them in Google
+    Photos via Playwright, then delete locally once staging is confirmed.
+
+    Requires both ffprobe (duration check) and Playwright — run via the
+    `delete` service, same as `delete`/`stage`:
+        docker compose run -p 6080:6080 delete detect-short-videos --no-dry-run
 
     After this command, run:
         docker compose run -p 6080:6080 delete delete --album=short-videos --no-dry-run --confirm
@@ -60,39 +65,34 @@ def detect_short_videos(dry_run: bool = True, max_duration_secs: float = 3.0) ->
     with db.get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT media_item_id, filename, local_path, mime_type
+            SELECT id, filename, local_path, local_timestamp
             FROM media_items
-            WHERE local_path IS NOT NULL
-              AND local_video_purged_at IS NULL
+            WHERE local_video_purged_at IS NULL
               AND (label IS NULL OR label != 'short_video')
             """
         ).fetchall()
 
     candidates = [
-        (dict(row), Path(row["local_path"]))
-        for row in rows
-        if (
-            ((row["mime_type"] or "").startswith("video/") or _is_video(Path(row["local_path"])))
-            and Path(row["local_path"]).exists()
-        )
+        dict(row) for row in rows
+        if _is_video(Path(row["local_path"])) and Path(row["local_path"]).exists()
     ]
 
     log_info("detect_short_videos", "Scanning local videos", total=len(candidates))
     print(f"Scanning {len(candidates)} local video file(s) for duration ≤ {max_duration_secs}s…")
 
-    short_items: list[tuple[str, str, Path]] = []  # (media_item_id, filename, path)
+    short_items: list[dict] = []
 
-    for row, path in candidates:
-        duration = _ffprobe_duration(path)
+    for item in candidates:
+        duration = _ffprobe_duration(Path(item["local_path"]))
         if duration is None:
             log_item("detect_short_videos", "duration_unknown",
-                     media_item_id=row["media_item_id"], filename=row["filename"])
+                     item_id=item["id"], filename=item["filename"])
             continue
         if duration <= max_duration_secs:
             log_item("detect_short_videos", "short_video_found",
-                     media_item_id=row["media_item_id"], filename=row["filename"],
+                     item_id=item["id"], filename=item["filename"],
                      duration_secs=round(duration, 2))
-            short_items.append((row["media_item_id"], row["filename"], path))
+            short_items.append(item)
 
     print(f"Found {len(short_items)} video(s) ≤ {max_duration_secs}s.")
 
@@ -101,48 +101,72 @@ def detect_short_videos(dry_run: bool = True, max_duration_secs: float = 3.0) ->
         return
 
     if dry_run:
-        print(f"\n[DRY-RUN] Would stage into '{_SHORT_VIDEO_ALBUM_TITLE}' and delete locally:")
-        for mid, fname, _ in short_items[:30]:
-            print(f"  {fname}  ({mid})")
+        print(f"\n[DRY-RUN] Would locate + stage into '{_SHORT_VIDEO_ALBUM_TITLE}' and delete locally:")
+        for item in short_items[:30]:
+            print(f"  {item['filename']}  (id={item['id']})")
         if len(short_items) > 30:
             print(f"  … and {len(short_items) - 30} more")
         print(
-            "\nRe-run with --no-dry-run to stage and delete locally.\n"
+            "\nRe-run with --no-dry-run to locate, stage, and delete locally.\n"
             "Then trash from Google Photos with:\n"
             "  docker compose run -p 6080:6080 delete delete --album=short-videos --no-dry-run --confirm"
         )
         return
 
-    # Ensure album exists
+    with db.get_conn() as conn:
+        for item in short_items:
+            conn.execute(
+                "UPDATE media_items SET label='short_video', updated_at=? WHERE id=?",
+                (db.now_iso(), item["id"]),
+            )
+
+    from . import locate_stage
+    from playwright.sync_api import sync_playwright
+
     creds = auth.get_credentials()
     album = photos_api.get_or_create_album(creds, _SHORT_VIDEO_ALBUM_TITLE)
     album_id = album["id"]
     with db.get_conn() as conn:
         db.get_or_create_album(conn, album_id, _SHORT_VIDEO_ALBUM_TITLE, "short_video")
 
-    # Stage all in one (batched) API call
-    media_ids = [mid for mid, _, _ in short_items]
-    photos_api.batch_add_to_album(creds, album_id, media_ids)
-
-    # Update DB + delete local files
-    now = db.now_iso()
-    for mid, fname, path in short_items:
-        with db.get_conn() as conn:
-            conn.execute(
-                """UPDATE media_items
-                   SET label='short_video', staged_album_id=?, staged_at=?,
-                       local_path=NULL, local_video_purged_at=?, updated_at=?
-                   WHERE media_item_id=?""",
-                (album_id, now, now, now, mid),
+    with sync_playwright() as pw:
+        b = browser.launch_browser(pw)
+        context = browser.load_or_create_context(pw, b)
+        page = context.new_page()
+        browser.ensure_logged_in(page, "https://photos.google.com")
+        try:
+            staged, unmatched = locate_stage.stage_items(
+                page, "short_video", album_id, _SHORT_VIDEO_ALBUM_TITLE, short_items
             )
+        finally:
+            browser.save_context(context)
+            context.close()
+            b.close()
+
+    # Only delete local copies once cloud staging is confirmed for that item.
+    with db.get_conn() as conn:
+        staged_ids = {
+            r["id"] for r in conn.execute(
+                "SELECT id FROM media_items WHERE staged_album_id=?", (album_id,)
+            ).fetchall()
+        }
+
+    deleted_locally = 0
+    for item in short_items:
+        if item["id"] not in staged_ids:
+            continue
+        path = Path(item["local_path"])
         if path.exists():
             path.unlink()
+        with db.get_conn() as conn:
+            db.set_video_purged(conn, item["id"])
+        deleted_locally += 1
         log_item("detect_short_videos", "staged_and_deleted_locally",
-                 media_item_id=mid, filename=fname, album_id=album_id)
+                 item_id=item["id"], filename=item["filename"], album_id=album_id)
 
     print(
-        f"\nDone: {len(short_items)} short video(s) staged into '{_SHORT_VIDEO_ALBUM_TITLE}'"
-        " and removed from local library."
+        f"\nDone: {staged} staged into '{_SHORT_VIDEO_ALBUM_TITLE}' and removed locally, "
+        f"{unmatched} not found in the cloud (left in place — re-run to retry)."
         "\n\nNEXT STEP — trash from Google Photos (requires Playwright; test on a small album first):"
         "\n  docker compose run -p 6080:6080 delete delete --album=short-videos --no-dry-run --confirm"
     )
@@ -170,7 +194,7 @@ def purge_local_videos(dry_run: bool = True) -> None:
     for path in video_files:
         with db.get_conn() as conn:
             row = conn.execute(
-                "SELECT media_item_id, label FROM media_items WHERE local_path=?",
+                "SELECT id, label FROM media_items WHERE local_path=?",
                 (str(path),),
             ).fetchone()
 
@@ -187,7 +211,7 @@ def purge_local_videos(dry_run: bool = True) -> None:
                 log_item("purge_local_videos", "deleted", path=str(path))
                 if row:
                     with db.get_conn() as conn:
-                        db.set_video_purged(conn, row["media_item_id"])
+                        db.set_video_purged(conn, row["id"])
                 deleted += 1
             except OSError as e:
                 log_error("purge_local_videos", "delete_failed", path=str(path), error=str(e))

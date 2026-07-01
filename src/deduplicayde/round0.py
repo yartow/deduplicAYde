@@ -1,19 +1,17 @@
-"""Round 0: Build the mediaItemId <-> local file mapping table.
+"""Round 0: Catalog local files.
 
-Matching strategy (in priority order):
-  1. Filename (case-insensitive) against files under DATA_DIR/library/.
-  2. When multiple local files share the same filename, resolve each file's
-     "true" timestamp and compare against the API's mediaMetadata.creationTime:
-       a. EXIF DateTimeOriginal  (via exifread, Pillow as fallback)
-       b. photoTakenTime in the Takeout JSON sidecar  (*.json next to the file)
-     Filesystem mtime/ctime are NEVER used — Takeout extraction corrupts them.
-  3. If timestamps don't resolve the ambiguity, phash is used as a tiebreaker
-     (only computed on demand for genuinely ambiguous cases).
-  4. Files with no EXIF and no sidecar are logged as `no_timestamp` so they
-     can be reviewed manually if they end up in an ambiguous match.
+Google's March 2024 Photos Library API policy change restricts our OAuth scope
+to items the app itself uploaded, so there is no way to enumerate the existing
+cloud library via the API anymore (see CLAUDE.md). Round 0 is therefore local-only:
+it walks DATA_DIR/library/, resolves each file's true capture timestamp, and
+records it in state.db. Identity is the local file path — later rounds locate
+the corresponding cloud item directly via Playwright when they need to.
 
-Page tokens are checkpointed after each full page of 100 items, so a crash
-loses at most one page of work.  Re-running is always safe.
+Timestamp resolution (in priority order):
+  1. EXIF DateTimeOriginal  (via exifread, Pillow as fallback)
+  2. photoTakenTime in the Takeout JSON sidecar  (*.json next to the file)
+  Filesystem mtime/ctime are NEVER used — Takeout extraction corrupts them.
+  Files with neither source are logged as `no_timestamp` for manual review.
 
 Run:
     docker compose run cli round0
@@ -24,12 +22,10 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-import imagehash
-from PIL import Image
 from tqdm import tqdm
 
-from . import db, rclone_api
-from .logger import log_info, log_item, log_error
+from . import db
+from .logger import log_info, log_item
 
 _LIBRARY_DIR = os.path.join(os.environ.get("DATA_DIR", "/data"), "library")
 _ROUND = "round0"
@@ -38,10 +34,6 @@ _IMAGE_SUFFIXES = {
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif",
     ".tif", ".tiff", ".bmp", ".mp4", ".mov", ".avi", ".mkv",
 }
-
-# Seconds window for EXIF (local-time) vs API UTC comparison.
-# 25 hours covers the widest possible timezone offset (UTC+14 / UTC-12).
-_TIMESTAMP_WINDOW_SECS = 25 * 3600
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +55,7 @@ def _exif_timestamp(path: Path) -> str | None:
 
     # Fallback: Pillow _getexif
     try:
+        from PIL import Image
         from PIL.ExifTags import TAGS
         img = Image.open(path)
         exif = getattr(img, "_getexif", lambda: None)()
@@ -158,225 +151,78 @@ def _resolve_timestamp(path: Path) -> tuple[str | None, str]:
     return None, "none"
 
 
-def _delta_seconds(local_ts: str, local_source: str, api_ts: str) -> float:
-    """Absolute seconds between a local timestamp and the API creationTime.
-
-    EXIF timestamps carry no timezone — we compare naively (strip TZ from the
-    API time too) and accept up to _TIMESTAMP_WINDOW_SECS as a valid match.
-    Sidecar timestamps are UTC, so we compare directly.
-    """
-    api_dt = datetime.fromisoformat(api_ts.replace("Z", "+00:00"))
-
-    if local_source == "sidecar":
-        local_dt = datetime.fromisoformat(local_ts.replace("Z", "+00:00"))
-        return abs((local_dt - api_dt).total_seconds())
-    else:
-        # EXIF: no TZ — compare naively
-        local_dt_naive = datetime.fromisoformat(local_ts)
-        api_dt_naive = api_dt.replace(tzinfo=None)
-        return abs((local_dt_naive - api_dt_naive).total_seconds())
-
-
-def _compute_phash(path: Path) -> str | None:
-    try:
-        try:
-            from pillow_heif import register_heif_opener
-            register_heif_opener()
-        except ImportError:
-            pass
-        return str(imagehash.phash(Image.open(path)))
-    except Exception:
-        return None
-
-
 # ---------------------------------------------------------------------------
 # Local file index
 # ---------------------------------------------------------------------------
 
-def _index_local_files() -> dict[str, list[Path]]:
-    """Return {lowercase_filename: [Path, ...]} for all media files under library/."""
-    index: dict[str, list[Path]] = {}
+def _iter_local_files() -> list[Path]:
     library = Path(_LIBRARY_DIR)
     if not library.exists():
         log_info(_ROUND, "Library directory not found", path=_LIBRARY_DIR)
-        return index
-    for p in library.rglob("*"):
-        if p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES:
-            index.setdefault(p.name.lower(), []).append(p)
-    return index
-
-
-# ---------------------------------------------------------------------------
-# Candidate selection
-# ---------------------------------------------------------------------------
-
-def _pick_candidate(
-    candidates: list[Path],
-    api_creation_time: str | None,
-    item_id: str,
-    filename: str,
-) -> tuple[Path, str, str | None, str]:
-    """Choose the best local file from a list of same-named candidates.
-
-    Returns (path, selection_reason, local_timestamp, local_timestamp_source).
-    """
-    if len(candidates) == 1:
-        ts, src = _resolve_timestamp(candidates[0])
-        reason = "sole_candidate" if ts else "sole_candidate_no_timestamp"
-        return candidates[0], reason, ts, src
-
-    # Multiple candidates — use timestamps to disambiguate
-    if not api_creation_time:
-        log_item(
-            _ROUND, "ambiguous_no_api_time",
-            media_item_id=item_id, filename=filename, candidates=len(candidates),
-        )
-        ts, src = _resolve_timestamp(candidates[0])
-        return candidates[0], "no_api_time_took_first", ts, src
-
-    scored: list[tuple[float, Path, str | None, str]] = []
-    for path in candidates:
-        ts, src = _resolve_timestamp(path)
-        if ts:
-            delta = _delta_seconds(ts, src, api_creation_time)
-        else:
-            delta = float("inf")
-        scored.append((delta, path, ts, src))
-
-    scored.sort(key=lambda x: x[0])
-    best_delta, best_path, best_ts, best_src = scored[0]
-
-    if best_delta <= _TIMESTAMP_WINDOW_SECS:
-        reason = f"timestamp_{best_src}"
-    else:
-        # Timestamps exist but don't match any candidate well — phash tiebreak
-        reason = _phash_tiebreak(candidates, scored, item_id, filename)
-        best_path = candidates[0]   # phash_tiebreak logs; just use first as fallback
-        best_ts, best_src = _resolve_timestamp(best_path)
-
-    return best_path, reason, best_ts, best_src
-
-
-def _phash_tiebreak(
-    candidates: list[Path],
-    scored: list[tuple],
-    item_id: str,
-    filename: str,
-) -> str:
-    """Log ambiguity; phash matching against the API would require a download.
-    For now, flag the ambiguity and let Round 4 handle actual dedup."""
-    log_item(
-        _ROUND,
-        "ambiguous_timestamp_mismatch",
-        media_item_id=item_id,
-        filename=filename,
-        candidates=len(candidates),
-        best_delta_hours=round(scored[0][0] / 3600, 1) if scored else None,
-    )
-    return "phash_fallback_took_first"
+        return []
+    return [
+        p for p in library.rglob("*")
+        if p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES
+    ]
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def run(limit: int | None = None, refresh_catalog: bool = False) -> None:
+def run(limit: int | None = None) -> None:
     db.init_db()
-    log_info(_ROUND, "Starting Round 0: building ID mapping")
+    log_info(_ROUND, "Starting Round 0: cataloging local files")
 
-    # --- Phase A: catalog fetch (rclone) or load from DB cache ---
+    files = _iter_local_files()
+    total = len(files)
+    log_info(_ROUND, "Local file scan complete", file_count=total)
+    print(f"Local files found: {total}")
+
     with db.get_conn() as conn:
-        cat_row = conn.execute(
-            "SELECT completed_at FROM round_progress WHERE round_name='round0_catalog'"
-        ).fetchone()
-    catalog_ready = cat_row and cat_row["completed_at"]
-
-    if catalog_ready and not refresh_catalog:
-        print("Catalog already in DB — skipping rclone fetch.")
-        print("(Use --refresh-catalog to re-fetch from Google Photos.)")
-        with db.get_conn() as conn:
-            all_items = db.get_catalog_items(conn)
-        log_info(_ROUND, "Using cached catalog", item_count=len(all_items))
-        print(f"Catalog: {len(all_items)} items loaded from DB.")
-    else:
-        print("Fetching full library from rclone (may take a few minutes for large libraries)…")
-        all_items = list(rclone_api.iter_media_items())
-        log_info(_ROUND, "rclone listing complete", total=len(all_items))
-        print(f"rclone returned {len(all_items)} items.")
-        # Persist all items to DB before matching begins
-        with db.get_conn() as conn:
-            for item in all_items:
-                db.upsert_media_item(conn, item)
-            # The rclone catalog fetch above is always run in full — `limit`
-            # only caps Phase B (local file matching) below — so the catalog
-            # cache is complete here regardless of `limit`.
-            db.mark_round_complete(conn, "round0_catalog")
-
-    total = len(all_items)
-
-    # --- Phase B: local file matching ---
-    local_index = _index_local_files()
-    local_file_count = sum(len(v) for v in local_index.values())
-    log_info(_ROUND, "Local file index ready", file_count=local_file_count)
-    print(f"Local files indexed: {local_file_count}")
+        already_cataloged = {
+            r["local_path"] for r in conn.execute("SELECT local_path FROM media_items")
+        }
 
     processed = 0
-    matched = 0
     skipped = 0
     no_timestamp_count = 0
 
-    with tqdm(desc="Round 0: mapping", unit=" items", total=total) as bar:
-        for item in all_items:
-            item_id = item["id"]
-            filename = item["filename"]
-            api_creation_time = item.get("mediaMetadata", {}).get("creationTime")
+    with tqdm(desc="Round 0: cataloging", unit=" files", total=total) as bar:
+        for path in files:
+            if str(path) in already_cataloged:
+                skipped += 1
+                bar.update(1)
+                continue
+
+            local_ts, local_src = _resolve_timestamp(path)
+
+            if local_src == "none":
+                no_timestamp_count += 1
+                log_item(
+                    _ROUND,
+                    "no_timestamp",
+                    filename=path.name,
+                    path=str(path),
+                    note="neither EXIF nor sidecar found",
+                )
 
             with db.get_conn() as conn:
-                row = conn.execute(
-                    "SELECT local_path FROM media_items WHERE media_item_id=?",
-                    (item_id,),
-                ).fetchone()
+                db.upsert_local_item(
+                    conn,
+                    local_path=str(path),
+                    filename=path.name,
+                    file_size=path.stat().st_size,
+                    local_timestamp=local_ts,
+                    local_timestamp_source=local_src,
+                )
 
-                if row and row["local_path"]:
-                    skipped += 1
-                    bar.update(1)
-                    continue
-
-                candidates = local_index.get(filename.lower(), [])
-
-                if not candidates:
-                    log_item(_ROUND, "no_local_match", media_item_id=item_id, filename=filename)
-                else:
-                    best_path, reason, local_ts, local_src = _pick_candidate(
-                        candidates, api_creation_time, item_id, filename
-                    )
-
-                    if local_src == "none":
-                        no_timestamp_count += 1
-                        log_item(
-                            _ROUND,
-                            "no_timestamp",
-                            media_item_id=item_id,
-                            filename=filename,
-                            path=str(best_path),
-                            note="neither EXIF nor sidecar found — matched by filename only",
-                        )
-
-                    db.set_local_path(
-                        conn, item_id,
-                        str(best_path), best_path.stat().st_size,
-                        local_timestamp=local_ts,
-                        local_timestamp_source=local_src,
-                    )
-                    matched += 1
-                    log_item(
-                        _ROUND, "mapped",
-                        media_item_id=item_id,
-                        filename=filename,
-                        local_path=str(best_path),
-                        reason=reason,
-                        ts_source=local_src,
-                    )
+            log_item(
+                _ROUND, "cataloged",
+                filename=path.name,
+                local_path=str(path),
+                ts_source=local_src,
+            )
 
             processed += 1
             bar.update(1)
@@ -390,22 +236,16 @@ def run(limit: int | None = None, refresh_catalog: bool = False) -> None:
         if not limit:
             db.mark_round_complete(conn, _ROUND)
 
-    unmapped = processed - matched
     log_info(
         _ROUND, "Round 0 complete",
-        processed=processed, matched=matched, skipped=skipped,
-        unmapped=unmapped, no_timestamp=no_timestamp_count,
+        processed=processed, skipped=skipped, no_timestamp=no_timestamp_count,
     )
-    print(
-        f"\nRound 0 done: {processed} items scanned, "
-        f"{matched} matched to local files, "
-        f"{unmapped} unmatched (cloud-only or Takeout not yet imported)."
-    )
+    print(f"\nRound 0 done: {processed} local files cataloged, {skipped} already up to date.")
     if no_timestamp_count:
         print(
-            f"  {no_timestamp_count} matched files had no EXIF or sidecar timestamp.\n"
+            f"  {no_timestamp_count} files had no EXIF or sidecar timestamp.\n"
             f"  Search the logs for outcome=no_timestamp to review them manually:\n"
             f"  grep no_timestamp /data/logs/round0_*.jsonl"
         )
-    if unmapped:
-        print("Re-run round0 after importing each Takeout batch to map newly imported files.")
+    if limit and processed >= limit:
+        print("Re-run round0 without --limit (or with a higher one) to catalog the rest.")

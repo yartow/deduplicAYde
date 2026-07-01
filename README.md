@@ -7,12 +7,19 @@ human verification step before anything is permanently deleted.
 ## Why this exists
 
 - Google Photos Library API can stage items into albums (`albums.batchAddMediaItems`)
-  for **any** item in the library, but it has **no endpoint that deletes existing
-  media items**. Actual deletion only happens through the web/mobile UI's trash
-  action.
-- So: detection and staging are done via the API; actual deletion is done via
-  browser automation (Playwright) driving the real photos.google.com UI, which is
-  the only thing that genuinely trashes items and frees storage.
+  and enumerate the library (`mediaItems.list/search`) — but only for items **the
+  requesting app itself uploaded**. This is a Google policy change (March 2024);
+  it applies regardless of which OAuth client is used, and there's no way to get a
+  broader grant for personal-use projects. Since this app has never uploaded
+  anything, the API can neither list the existing library nor stage pre-existing
+  items into an album. The only thing it can still do is create a fresh, empty
+  album. It also has **no endpoint that deletes existing media items** — that only
+  happens through the web/mobile UI's trash action.
+- So: local cataloging and detection are entirely local (no network); *locating* a
+  flagged item on photos.google.com, *staging* it into a review album, and
+  *deleting* staged items are all done via the same mechanism — browser automation
+  (Playwright) driving the real photos.google.com UI as the logged-in human user,
+  which isn't subject to the API's OAuth scope restriction at all.
 - The library (453GB) is too large to fully download at once alongside everything
   else on a 620GB MacBook Pro, so the library is processed in two halves (by date
   range), each going through detection, staging, manual review, and deletion before
@@ -21,15 +28,16 @@ human verification step before anything is permanently deleted.
 ## High-level flow
 
 ```
-Round 0  Build a mapping table: Google Photos mediaItemId <-> local filename/hash
+Round 0  Catalog local files under DATA_DIR/library/: filename, resolved EXIF/
+         sidecar timestamp, path. No cloud interaction (see "Why this exists").
 Round 1  Download first half (Takeout) -> detect receipts & vague photos locally
-         -> stage matches into "Receipts" / "Vague" albums via API
-         -> delete via Playwright (receipts: auto after dry-run confirm;
-            vague: only after manual visual review in the album)
 Round 2  Same as Round 1, for the second half of the library
-Round 3  Re-pull full mediaItems list; diff against the mapping table to find what
-         was actually deleted in Google Photos; mirror those deletions locally
-         (except files already moved into the receipts folder)
+Stage    Locate each detected item on photos.google.com (via Playwright) and add
+         it to a "Receipts" / "Vague" review album (created via the API)
+Delete   Trash staged items via Playwright (receipts: auto after dry-run confirm;
+         vague: only after manual visual review in the album)
+Round 3  Local-only sweep: delete local copies of anything already confirmed
+         trashed by the Delete step (except files already moved into receipts/)
 Round 4  Perceptual-hash dedup pass across remaining local files; side-by-side
          full-resolution review web app to confirm and act on duplicate pairs
 ```
@@ -80,18 +88,23 @@ Claude Code finds simpler to set up reliably on macOS.
    time — only processes zips still sitting in `~/Downloads`. Uses `ditto`
    (not `unzip`) since Takeout's non-UTF8-flagged accented filenames trip up
    Apple's `unzip`.
-6. `docker compose run cli round0` — builds the ID mapping for whatever is already
-   matched/downloaded so far (re-run after each Takeout import).
+6. `docker compose run cli round0` — catalogs whatever is already extracted into
+   `library/` so far (re-run after each Takeout import).
 
 ## Running a round
 
 ```
-docker compose run cli round1 --half=1 --dry-run     # detect + stage only, no deletion
-docker compose run cli round1 --half=1 --delete-receipts
-docker compose run cli review                        # open the Round 4 web app
+docker compose run cli round1                                     # detect (first half)
+docker compose run -p 6080:6080 delete stage --purpose=receipt --dry-run   # preview staging
+docker compose run -p 6080:6080 delete stage --purpose=receipt --no-dry-run
+docker compose run -p 6080:6080 delete delete --album=receipts --no-dry-run --confirm
+docker compose up review                                          # open the Round 4 web app
 ```
 
-Every command is safe to stop and re-run; it picks up from `state.db`.
+Every command is safe to stop and re-run; it picks up from `state.db`. The `stage`
+and `delete` commands require the Playwright-capable `delete` service (watch
+progress at `http://localhost:6080/vnc.html`) — their DOM selectors are
+best-effort and should be validated against a small test album first.
 
 ## Status / progress
 

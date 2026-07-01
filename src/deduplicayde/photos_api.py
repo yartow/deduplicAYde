@@ -2,6 +2,15 @@
 
 Uses an authorized requests.Session rather than the discovery client because
 the Photos API has no maintained discovery document in the Python SDK.
+
+Only album creation lives here — Google's March 2024 policy change restricts
+our OAuth scope (photoslibrary.readonly.appcreateddata) to items this app
+uploaded itself, so mediaItems.list/search can never enumerate the existing
+library, and albums.batchAddMediaItems can never be given a valid
+mediaItemId for a pre-existing item (see CLAUDE.md). Locating and staging
+items now goes through Playwright browser automation instead
+(locate_stage.py) — only creating a fresh, empty, app-owned album is still
+possible via this API.
 """
 import time
 
@@ -9,7 +18,6 @@ from google.auth.transport.requests import AuthorizedSession
 from google.oauth2.credentials import Credentials
 
 _BASE = "https://photoslibrary.googleapis.com/v1"
-_PAGE_SIZE = 100
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
@@ -61,32 +69,3 @@ def get_or_create_album(creds: Credentials, title: str) -> dict:
     # Create new
     result = _post(session, "albums", {"album": {"title": title}})
     return result
-
-
-def batch_add_to_album(
-    creds: Credentials, album_id: str, media_item_ids: list[str]
-) -> None:
-    """Add up to 50 media items to an album in one call."""
-    session = _session(creds)
-    for i in range(0, len(media_item_ids), 50):
-        chunk = media_item_ids[i : i + 50]
-        _post(
-            session,
-            f"albums/{album_id}:batchAddMediaItems",
-            {"mediaItemIds": chunk},
-        )
-
-
-def list_album_media_items(creds: Credentials, album_id: str) -> list[dict]:
-    """Return all media items in the given album."""
-    session = _session(creds)
-    items = []
-    params: dict = {"albumId": album_id, "pageSize": _PAGE_SIZE}
-    while True:
-        data = _post(session, "mediaItems:search", params)
-        items.extend(data.get("mediaItems", []))
-        next_token = data.get("nextPageToken")
-        if not next_token:
-            break
-        params["pageToken"] = next_token
-    return items

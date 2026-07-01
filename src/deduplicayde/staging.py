@@ -1,9 +1,11 @@
-"""Stage detected items into Google Photos albums via the API.
+"""Create the Google Photos review albums used by locate_stage.py.
 
-Albums are created on first use and their IDs are persisted in state.db.
+Album creation still works via the API (fresh, app-owned content). Adding
+pre-existing items to an album does not (see CLAUDE.md) — that part moved to
+locate_stage.py, which drives the album's "Add to album" UI via Playwright.
 """
-from . import auth, db, photos_api
-from .logger import log_info, log_item
+from . import db, photos_api
+from .logger import log_info
 
 _ALBUM_TITLES = {
     "receipt": "deduplicAYde – Receipts",
@@ -34,34 +36,3 @@ def get_or_create_albums(creds) -> dict[str, str]:
             log_info("staging", f"Album ready", purpose=purpose, album_id=album_id)
 
     return album_ids
-
-
-def stage_items(
-    creds,
-    purpose: str,
-    album_id: str,
-    media_item_ids: list[str],
-    dry_run: bool = True,
-) -> int:
-    """Add items to the given album. Returns count staged."""
-    if not media_item_ids:
-        return 0
-
-    if dry_run:
-        log_info(
-            "staging",
-            f"[DRY-RUN] Would stage {len(media_item_ids)} items into {purpose} album",
-            album_id=album_id,
-        )
-        for mid in media_item_ids:
-            log_item("staging", "would_stage", media_item_id=mid, purpose=purpose)
-        return len(media_item_ids)
-
-    photos_api.batch_add_to_album(creds, album_id, media_item_ids)
-
-    with db.get_conn() as conn:
-        for mid in media_item_ids:
-            db.set_staged(conn, mid, album_id)
-            log_item("staging", "staged", media_item_id=mid, purpose=purpose, album_id=album_id)
-
-    return len(media_item_ids)

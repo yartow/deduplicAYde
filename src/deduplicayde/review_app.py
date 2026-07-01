@@ -63,8 +63,8 @@ def review_page():
                    a.local_path AS path_a, a.filename AS name_a,
                    b.local_path AS path_b, b.filename AS name_b
             FROM duplicate_pairs dp
-            JOIN media_items a ON a.media_item_id = dp.item_a_id
-            JOIN media_items b ON b.media_item_id = dp.item_b_id
+            JOIN media_items a ON a.id = dp.item_a_id
+            JOIN media_items b ON b.id = dp.item_b_id
             WHERE dp.review_status = 'pending'
               AND a.deletion_status IS NULL
               AND b.deletion_status IS NULL
@@ -90,8 +90,8 @@ def review_page():
     item_a_id = pair["item_a_id"]
     item_b_id = pair["item_b_id"]
     hamming = pair["hamming_distance"]
-    name_a = pair["name_a"] or item_a_id
-    name_b = pair["name_b"] or item_b_id
+    name_a = pair["name_a"] or str(item_a_id)
+    name_b = pair["name_b"] or str(item_b_id)
 
     # Escape for HTML attribute use
     def esc(s: str) -> str:
@@ -138,11 +138,11 @@ button:hover {{ opacity: 0.85; }}
 <div class="images">
   <div class="pane">
     <div class="pane-label" title="{esc(name_a)}">{esc(name_a)}</div>
-    <img src="/img/{esc(item_a_id)}" alt="{esc(name_a)}" loading="eager">
+    <img src="/img/{item_a_id}" alt="{esc(name_a)}" loading="eager">
   </div>
   <div class="pane">
     <div class="pane-label" title="{esc(name_b)}">{esc(name_b)}</div>
-    <img src="/img/{esc(item_b_id)}" alt="{esc(name_b)}" loading="eager">
+    <img src="/img/{item_b_id}" alt="{esc(name_b)}" loading="eager">
   </div>
 </div>
 
@@ -198,23 +198,23 @@ def record_decision(pair_id: int, decision: str):
 
         if decision == "keep_a":
             conn.execute(
-                "UPDATE media_items SET label='duplicate', updated_at=? WHERE media_item_id=?",
+                "UPDATE media_items SET label='duplicate', updated_at=? WHERE id=?",
                 (db.now_iso(), pair["item_b_id"]),
             )
         elif decision == "keep_b":
             conn.execute(
-                "UPDATE media_items SET label='duplicate', updated_at=? WHERE media_item_id=?",
+                "UPDATE media_items SET label='duplicate', updated_at=? WHERE id=?",
                 (db.now_iso(), pair["item_a_id"]),
             )
 
     return RedirectResponse("/review", status_code=303)
 
 
-@app.get("/img/{item_id:path}")
-def serve_image(item_id: str):
+@app.get("/img/{item_id:int}")
+def serve_image(item_id: int):
     with db.get_conn() as conn:
         row = conn.execute(
-            "SELECT local_path FROM media_items WHERE media_item_id=?", (item_id,)
+            "SELECT local_path FROM media_items WHERE id=?", (item_id,)
         ).fetchone()
 
     if row is None or not row["local_path"]:
