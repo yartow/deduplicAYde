@@ -18,6 +18,7 @@ Run:
     docker compose run cli round0 --limit=200   # small smoke test
 """
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,14 @@ from tqdm import tqdm
 
 from . import db
 from .logger import log_info, log_item
+
+# exifread logs "File format not recognized." / "<X> file does not have exif
+# data." at WARNING level for every non-JPEG/TIFF/HEIC/WEBP/PNG-with-exif file
+# it's asked to parse (PNGs without exif, videos, etc.) — expected for most of
+# the library, and since we never call exifread's own setup_logger(), Python's
+# logging.lastResort handler prints every one of them to stderr. We already
+# catch and handle the "no EXIF found" case ourselves; silence the noise.
+logging.getLogger("exifread").setLevel(logging.ERROR)
 
 _LIBRARY_DIR = os.path.join(os.environ.get("DATA_DIR", "/data"), "library")
 _ROUND = "round0"
@@ -137,6 +146,14 @@ def _sidecar_timestamp(path: Path) -> str | None:
     if sidecar:
         return _read_sidecar_ts(sidecar)
 
+    # Takeout exports an in-app-edited photo as "<name>-edited.<ext>" but never
+    # writes a sidecar for it — only the original "<name>.<ext>" gets one. The
+    # edit doesn't change capture time, so fall back to the original's sidecar.
+    if path.stem.endswith("-edited"):
+        original = path.with_name(path.stem[: -len("-edited")] + path.suffix)
+        if original != path:
+            return _sidecar_timestamp(original)
+
     return None
 
 
@@ -180,8 +197,15 @@ def run(limit: int | None = None) -> None:
     print(f"Local files found: {total}")
 
     with db.get_conn() as conn:
+        # Rows with local_timestamp IS NULL are retried every run, not just
+        # skipped forever — a timestamp-resolution fix (e.g. new sidecar
+        # fallback logic) should retroactively pick them up without a
+        # separate recatalog flag.
         already_cataloged = {
-            r["local_path"] for r in conn.execute("SELECT local_path FROM media_items")
+            r["local_path"]
+            for r in conn.execute(
+                "SELECT local_path FROM media_items WHERE local_timestamp IS NOT NULL"
+            )
         }
 
     processed = 0

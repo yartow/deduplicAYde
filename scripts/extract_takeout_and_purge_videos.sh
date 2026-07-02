@@ -7,6 +7,9 @@
 # video over VIDEO_MIN_DURATION seconds, logging each deletion to
 # DATA_DIR/logs/video_delete_<date>.jsonl. This runs unattended with no
 # review step - only use this copy once you're comfortable with that.
+# Then invokes classify_movies.py, which appends any newly deleted
+# full-length movies to DATA_DIR/logs/deleted_movies.csv (existing rows,
+# including hand-reviewed ones, are always preserved as-is).
 #
 # Uses `ditto` rather than `unzip`: Apple's bundled unzip mis-decodes
 # accented filenames that Takeout doesn't flag as UTF-8 (e.g. "Liberté"),
@@ -31,6 +34,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 VIDEO_DELETER="${VIDEO_DELETER_PATH:-$HOME/Documents/GitHub/HandyToolsMac/12. VideoDeleter/video_deleter.py}"
 VIDEO_MIN_DURATION="${VIDEO_MIN_DURATION:-5}"
+MOVIE_CLASSIFIER="${MOVIE_CLASSIFIER_PATH:-$HOME/Documents/GitHub/HandyToolsMac/12. VideoDeleter/classify_movies.py}"
 
 if [ -z "${DATA_DIR:-}" ] && [ -f "$REPO_ROOT/.env" ]; then
   DATA_DIR=$(grep -E '^DATA_DIR=' "$REPO_ROOT/.env" | tail -1 | cut -d= -f2-)
@@ -57,6 +61,14 @@ purge_videos() {
   python3 "$VIDEO_DELETER" --root "$DATA_DIR" --min-duration "$VIDEO_MIN_DURATION" \
     --include-unreadable --delete 2>&1 | tee -a "$LOG"
   log "PURGE done"
+
+  if [ ! -f "$MOVIE_CLASSIFIER" ]; then
+    log "SKIP movie classification - $MOVIE_CLASSIFIER not found"
+    return
+  fi
+  log "CLASSIFY start - updating $DATA_DIR/logs/deleted_movies.csv"
+  python3 "$MOVIE_CLASSIFIER" --root "$DATA_DIR" 2>&1 | tee -a "$LOG"
+  log "CLASSIFY done"
 }
 
 shopt -s nullglob

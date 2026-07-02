@@ -23,7 +23,12 @@ from . import db
 
 
 def cmd_auth(_args) -> None:
-    print("Starting OAuth flow. Open http://localhost:8080 in your browser...")
+    print(
+        "Starting OAuth flow. Watch for a 'Please visit this URL' line below and "
+        "open THAT URL (accounts.google.com) — not localhost:8080 directly. "
+        "localhost:8080 is just the callback the browser gets redirected to "
+        "after you approve access on Google's page."
+    )
     from . import auth
     auth.get_credentials()
     print("Authenticated successfully. Token saved.")

@@ -1,7 +1,12 @@
 """OAuth 2.0 flow for Google Photos Library API.
 
 First run:  docker compose run -p 8080:8080 cli auth
-            Then open http://localhost:8080 in your browser to complete sign-in.
+            The console prints a "Please visit this URL" line pointing at
+            accounts.google.com — open THAT, not localhost:8080 directly.
+            localhost:8080 is only the redirect target Google sends the
+            browser back to after you approve access; the local server there
+            shuts down as soon as it captures the code, so visiting it
+            yourself (before or after) hits nothing from this app.
             Token is saved to /secrets/token.json for future runs.
 """
 import os
