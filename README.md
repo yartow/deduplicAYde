@@ -90,6 +90,18 @@ Claude Code finds simpler to set up reliably on macOS.
    Apple's `unzip`.
 6. `docker compose run cli round0` — catalogs whatever is already extracted into
    `library/` so far (re-run after each Takeout import).
+7. Before the first `stage` or `delete` run (once, not per-round):
+   ```
+   docker compose run -p 6080:6080 delete login
+   ```
+   Opens a plain, non-automated browser window (watch at
+   `http://localhost:6080/vnc.html`) — log into your Google account there, then
+   just close the window. This exists because Google blocks sign-ins performed
+   inside an automation-controlled (Playwright/CDP) browser; `login` launches
+   the browser binary directly, bypassing Playwright, so the sign-in itself
+   never touches CDP. Every later `stage`/`delete` run reuses that
+   already-authenticated profile instead of signing in itself. See `browser.py`
+   and `CLAUDE.md` for why.
 
 ## Running a round
 

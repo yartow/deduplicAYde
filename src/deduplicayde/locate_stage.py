@@ -84,16 +84,13 @@ def run(purpose: str, dry_run: bool = True) -> None:
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as pw:
-        b = browser.launch_browser(pw)
-        context = browser.load_or_create_context(pw, b)
+        context = browser.launch_context(pw)
         page = context.new_page()
         browser.ensure_logged_in(page, _PHOTOS_URL)
         try:
             staged, unmatched = stage_items(page, purpose, album_id, album_title, items)
         finally:
-            browser.save_context(context)
             context.close()
-            b.close()
 
     print(
         f"\nStaging complete: {staged} located and added to '{album_title}', "

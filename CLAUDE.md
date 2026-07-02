@@ -22,7 +22,20 @@ overall design; this file covers implementation conventions and guardrails.
 - **Playwright (Python)** for everything that needs to see or act on existing
   library items: locating a flagged local file on photos.google.com, adding it to
   a review album, and trashing staged items — all driven as the logged-in human
-  user, which isn't subject to the OAuth scope restriction above.
+  user, which isn't subject to the OAuth scope restriction above. Confirmed live
+  that Google's login flow blocks sign-ins performed inside a CDP-attached
+  (Playwright-controlled) browser ("this browser or app may not be secure"),
+  independent of DOM selectors. Fix: `docker compose run -p 6080:6080 delete
+  login` launches the bundled Chromium binary directly via `subprocess`
+  (bypassing Playwright/CDP entirely, so no automation fingerprint) against a
+  persistent profile at `secrets/chrome-profile/`; the user signs into Google
+  there via noVNC, once. Every later `stage`/`delete` run reuses that
+  already-authenticated profile through `launch_persistent_context` — Playwright
+  never performs the sign-in handshake itself. Real Chrome (`channel="chrome"`)
+  isn't an option: no Linux arm64 build exists, and this runs on Apple Silicon;
+  the same bundled Chromium binary is used for both the manual login and the
+  automated runs, so there's no cross-browser profile-format risk either. See
+  `browser.py`.
 - **SQLite** (stdlib `sqlite3`, or `sqlmodel`/`peewee` if a lightweight ORM helps)
   for all checkpoint/state tracking.
 - **FastAPI + a minimal HTML/JS frontend** (or Flask, whichever is faster to ship)
@@ -42,12 +55,18 @@ overall design; this file covers implementation conventions and guardrails.
    items — with columns for detection results, staging status, review status,
    deletion status, timestamps).
 2. **No deletion via the Photos API.** The only API call used against the Photos
-   Library API is album creation (`albums.insert`/find-by-title); it has no
-   delete endpoint and, per rule 1's OAuth restriction, can't add pre-existing
-   items to an album either. Locating items and adding them to a review album,
-   as well as actually trashing staged items, are both Playwright automation
-   against the real web UI — the only code paths that touch existing library
-   items at all.
+   Library API is album creation (`albums.insert`); it has no delete endpoint
+   and, per rule 1's OAuth restriction, can't add pre-existing items to an
+   album either. Locating items and adding them to a review album, as well as
+   actually trashing staged items, are both Playwright automation against the
+   real web UI — the only code paths that touch existing library items at all.
+   Note: `albums.list` (find-by-title) also 403s under the restricted scope —
+   confirmed live on the first real `stage` run — even though Google's docs
+   list `photoslibrary.readonly.appcreateddata` as valid for it. Don't add a
+   list/search-based lookup back to `photos_api.py`; cross-run album
+   idempotency is tracked locally in the `albums` table instead (see
+   `staging.get_or_create_album`, which every caller needing an album must go
+   through).
 3. **Dry-run by default.** Any command with a destructive effect (staging into an
    album that will later be auto-deleted, triggering the Playwright delete flow,
    deleting local files) must require an explicit flag to actually execute, and
@@ -57,9 +76,13 @@ overall design; this file covers implementation conventions and guardrails.
    they're low-risk and you've described high confidence in the OCR/contour
    heuristic. Vague/blurry items must always pause for manual visual review inside
    the staged Google Photos album before the deletion step runs against them.
-5. **Round 3 reconciliation must never delete the receipts folder.** Local files
-   under `/data/receipts/` are permanent and excluded from the offline-deletion
-   sync, even though their corresponding cloud items were deleted.
+5. **Round 3 reconciliation must never delete the receipts folder.** When a
+   `label='receipt'` row is confirmed deleted from Google Photos, Round 3 moves
+   its local file out of `library/` into `/data/receipts/` instead of deleting
+   it — receipts are kept locally forever even though the cloud copy is gone.
+   Round 3 is the only code path allowed to write into `/data/receipts/`; once a
+   file lives there it's permanent and excluded from the offline-deletion sync
+   on every subsequent run.
 6. **Round 4 duplicate confirmation requires full-resolution side-by-side display**,
    not thumbnails — load both full images in the browser at a size that fits the
    viewport, not cropped/scaled-down previews.
@@ -90,7 +113,11 @@ overall design; this file covers implementation conventions and guardrails.
 - Before running the Playwright locate/stage flow (`stage`) or deletion flow
   (`delete`) for the first time, and before pointing either at anything larger
   than a small test album — their DOM selectors are best-effort and unverified
-  against the live site until run once and watched via noVNC.
+  against the live site until run once and watched via noVNC. Also before the
+  very first Playwright run of any kind: `docker compose run -p 6080:6080
+  delete login` must be run once so the persistent profile at
+  `secrets/chrome-profile/` exists and is signed into Google — see
+  `browser.py`'s `manual_login()`.
 - Before running `--delete-receipts` or any other non-dry-run flag against the
   full library for the first time.
 - Before installing any new system dependency that isn't already covered by the

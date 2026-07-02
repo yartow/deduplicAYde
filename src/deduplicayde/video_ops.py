@@ -13,7 +13,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from . import auth, browser, db, photos_api
+from . import auth, browser, db, staging
 from .logger import log_info, log_item, log_error
 
 _LIBRARY_DIR = Path(os.environ.get("DATA_DIR", "/data")) / "library"
@@ -124,14 +124,10 @@ def detect_short_videos(dry_run: bool = True, max_duration_secs: float = 3.0) ->
     from playwright.sync_api import sync_playwright
 
     creds = auth.get_credentials()
-    album = photos_api.get_or_create_album(creds, _SHORT_VIDEO_ALBUM_TITLE)
-    album_id = album["id"]
-    with db.get_conn() as conn:
-        db.get_or_create_album(conn, album_id, _SHORT_VIDEO_ALBUM_TITLE, "short_video")
+    album_id = staging.get_or_create_album(creds, "short_video", _SHORT_VIDEO_ALBUM_TITLE)
 
     with sync_playwright() as pw:
-        b = browser.launch_browser(pw)
-        context = browser.load_or_create_context(pw, b)
+        context = browser.launch_context(pw)
         page = context.new_page()
         browser.ensure_logged_in(page, "https://photos.google.com")
         try:
@@ -139,9 +135,7 @@ def detect_short_videos(dry_run: bool = True, max_duration_secs: float = 3.0) ->
                 page, "short_video", album_id, _SHORT_VIDEO_ALBUM_TITLE, short_items
             )
         finally:
-            browser.save_context(context)
             context.close()
-            b.close()
 
     # Only delete local copies once cloud staging is confirmed for that item.
     with db.get_conn() as conn:

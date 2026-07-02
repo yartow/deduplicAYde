@@ -98,7 +98,8 @@ for zip_path in "${zips[@]}"; do
   zip_size=$size2
   avail_kb=$(df -k "$DEST_DIR" | tail -1 | awk '{print $4}')
   avail_bytes=$((avail_kb * 1024))
-  needed=$((zip_size + zip_size / 2))   # 1.5x zip size as a safety buffer
+  needed=$((zip_size + zip_size /4))   # 1.5x zip size as a safety buffer
+  # needed=$((zip_size + zip_size ))   # 1.5x zip size as a safety buffer
 
   if [ "$avail_bytes" -lt "$needed" ]; then
     log "ABORT $z - not enough free space (avail=$avail_bytes needed=$needed). Free up space and re-run; earlier zips already extracted are untouched."

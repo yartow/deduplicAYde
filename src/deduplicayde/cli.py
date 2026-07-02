@@ -4,6 +4,7 @@ docker compose run cli <command> [options]
 
 Commands:
   auth                   Authenticate with Google Photos API (run once, opens port 8080)
+  login                  One-time: log into Google in a plain browser window (use delete service)
   round0                 Catalog local files (filename, EXIF/sidecar timestamp, path)
   round1                 Detect receipts/vague (first half of library)
   round2                 Detect receipts/vague (second half)
@@ -32,6 +33,11 @@ def cmd_auth(_args) -> None:
     from . import auth
     auth.get_credentials()
     print("Authenticated successfully. Token saved.")
+
+
+def cmd_login(_args) -> None:
+    from . import browser
+    browser.manual_login()
 
 
 def cmd_round0(args) -> None:
@@ -153,6 +159,12 @@ def main() -> None:
     # auth
     sub.add_parser("auth", help="Authenticate with Google Photos API (run once, port 8080)")
 
+    # login
+    sub.add_parser(
+        "login",
+        help="One-time: log into Google in a plain, non-automated browser window (use delete service)",
+    )
+
     # round0
     p0 = sub.add_parser("round0", help="Catalog local files (filename, EXIF/sidecar timestamp, path)")
     p0.add_argument("--limit", type=int, default=None, help="Stop after N files (testing)")
@@ -219,6 +231,7 @@ def main() -> None:
 
     dispatch = {
         "auth": cmd_auth,
+        "login": cmd_login,
         "round0": cmd_round0,
         "round1": cmd_round1,
         "round2": cmd_round2,

@@ -213,6 +213,15 @@ def set_deleted(conn: sqlite3.Connection, item_id: int, status: str = "deleted")
     )
 
 
+def update_local_path(conn: sqlite3.Connection, item_id: int, new_local_path: str) -> None:
+    """Repoint a row at a file's new location after it's been moved on disk
+    (e.g. round3.py archiving a confirmed-deleted receipt into receipts/)."""
+    conn.execute(
+        "UPDATE media_items SET local_path=?, updated_at=? WHERE id=?",
+        (new_local_path, now_iso(), item_id),
+    )
+
+
 def get_or_create_album(conn: sqlite3.Connection, album_id: str, title: str, purpose: str) -> None:
     conn.execute(
         """INSERT INTO albums (album_id, title, purpose)

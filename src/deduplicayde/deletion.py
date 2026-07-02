@@ -116,8 +116,7 @@ def _run_playwright(purpose: str) -> None:
     total_failed = 0
 
     with sync_playwright() as pw:
-        b = browser.launch_browser(pw)
-        context = browser.load_or_create_context(pw, b)
+        context = browser.launch_context(pw)
         page = context.new_page()
 
         try:
@@ -127,9 +126,7 @@ def _run_playwright(purpose: str) -> None:
                 total_deleted += deleted
                 total_failed += failed
         finally:
-            browser.save_context(context)
             context.close()
-            b.close()
 
     print(
         f"\nDeletion complete: {total_deleted} trashed, {total_failed} failed."
