@@ -22,6 +22,11 @@ _ALBUM_PURPOSE_MAP = {
 
 _BATCH_SIZE = 100  # items to trash per browser session before pausing
 
+# Hard wall-clock budget per batch, via browser.hard_timeout() — see that
+# function's docstring. Larger than locate_stage.py's per-day budget since a
+# batch can involve selecting/trashing up to _BATCH_SIZE items in one go.
+_BATCH_BUDGET_SECONDS = 300
+
 
 def run(album: str, confirm: bool = False, dry_run: bool = True) -> None:
     if album not in _ALBUM_PURPOSE_MAP:
@@ -149,7 +154,8 @@ def _delete_album_items(page, album_id: str, items: list[dict]) -> tuple[int, in
         batch = items[batch_start : batch_start + _BATCH_SIZE]
 
         try:
-            count = _trash_visible_items(page, album_url, len(batch))
+            with browser.hard_timeout(_BATCH_BUDGET_SECONDS):
+                count = _trash_visible_items(page, album_url, len(batch))
             deleted += count
             # Mark as deleted in DB
             with db.get_conn() as conn:
@@ -167,9 +173,11 @@ def _delete_album_items(page, album_id: str, items: list[dict]) -> tuple[int, in
                 log_item("deletion", "failed", item_id=item["id"], error=str(e))
             failed += len(batch)
 
-        # Reload between batches
+        # Reload between batches. "domcontentloaded" not "networkidle" —
+        # photos.google.com keeps background connections open indefinitely
+        # (confirmed live), so networkidle can time out even on success.
         if batch_start + _BATCH_SIZE < len(items):
-            page.reload(wait_until="networkidle")
+            page.reload(wait_until="domcontentloaded")
             time.sleep(2)
 
     return deleted, failed
@@ -182,37 +190,32 @@ def _trash_visible_items(page, album_url: str, expected_count: int) -> int:
     # Scroll to load all items
     browser.scroll_to_load_all(page)
 
-    # Click the first photo to enter selection mode
-    photos = page.locator("img[data-p]").all()
-    if not photos:
-        # Try alternative selectors
-        photos = page.locator("[data-media-key]").all()
-
-    if not photos:
+    # Selection checkboxes are [role="checkbox"] divs, confirmed live against
+    # the real account (see locate_stage.py's module docstring) — [data-p]/
+    # [data-media-key]/[data-is-checked] don't exist in the real DOM at all.
+    checkboxes = page.locator("[role='checkbox']").all()
+    if not checkboxes:
         raise RuntimeError("Could not find any photos in the album")
 
-    log_info("deletion", "Photos found in view", count=len(photos))
+    log_info("deletion", "Photos found in view", count=len(checkboxes))
 
-    # Enter selection mode by clicking first photo's checkbox area
-    # Google Photos shows checkboxes on hover
-    first_photo = photos[0]
-    first_photo.hover()
-    time.sleep(0.3)
-
-    # Look for a checkbox
-    checkbox = page.locator("[data-is-checked]").first
-    if checkbox.is_visible(timeout=2000):
-        checkbox.click()
-    else:
-        # Keyboard shortcut: hover + click usually works
-        first_photo.click(modifiers=["Shift"])
+    # Not Locator.hover()/click() — confirmed live (see browser.reveal()'s
+    # docstring) that these checkboxes are CSS-hidden until hovered, and
+    # hover()/click() both hang forever waiting for a "visible" precondition
+    # the element can only satisfy after the hover they're blocking.
+    browser.reveal(page, checkboxes[0])
+    browser.click(checkboxes[0])
 
     # Select all: Shift+A or look for "Select all" button
     time.sleep(0.5)
     page.keyboard.press("a")  # 'a' selects all in Google Photos
     time.sleep(1)
 
-    # Find and click trash/delete button
+    # Find and click trash/delete button. `Locator.is_visible()` is a one-shot
+    # state check, not a polling wait like click()/hover() — confirmed live in
+    # locate_stage.py that checking it immediately after a UI-changing action
+    # races the render and produces false "not found" errors even with a
+    # correct selector. `wait_for(state="visible")` polls properly.
     trash_button = None
     for selector in [
         "button[aria-label*='Delete']",
@@ -223,19 +226,22 @@ def _trash_visible_items(page, album_url: str, expected_count: int) -> int:
     ]:
         try:
             btn = page.locator(selector).first
-            if btn.is_visible(timeout=1000):
-                trash_button = btn
-                break
+            btn.wait_for(state="visible", timeout=1000)
+            trash_button = btn
+            break
         except PWTimeout:
             continue
 
     if trash_button is None:
         # Try the three-dot menu
         more_menu = page.locator("button[aria-label='More options']").first
-        if more_menu.is_visible(timeout=2000):
+        try:
+            more_menu.wait_for(state="visible", timeout=2000)
             more_menu.click()
             time.sleep(0.5)
             trash_button = page.locator("text=Move to trash").first
+        except PWTimeout:
+            pass
 
     if trash_button is None:
         raise RuntimeError("Could not find trash/delete button")
@@ -252,10 +258,10 @@ def _trash_visible_items(page, album_url: str, expected_count: int) -> int:
     ]:
         try:
             confirm_btn = page.locator(confirm_selector).last
-            if confirm_btn.is_visible(timeout=2000):
-                confirm_btn.click()
-                time.sleep(2)
-                break
+            confirm_btn.wait_for(state="visible", timeout=2000)
+            confirm_btn.click()
+            time.sleep(2)
+            break
         except Exception:
             continue
 

@@ -105,6 +105,21 @@ overall design; this file covers implementation conventions and guardrails.
    granting it to personal-use OAuth consents. Don't attempt to re-add
    cloud-side enumeration or ID-based staging without first re-verifying this
    restriction still holds.
+10. **`local_timestamp` is always naive local time in `ACCOUNT_TIMEZONE`, never
+    UTC.** Confirmed live: locate_stage.py matches local files to Google Photos
+    UI items by comparing `local_timestamp` against a timestamp parsed out of
+    each grid tile's aria-label, which Google Photos always renders in the
+    account's local display timezone with no UTC/offset indicator. Takeout
+    sidecar timestamps are natively a UTC epoch; storing them as UTC (with a
+    trailing "Z") broke every single sidecar-sourced match — both because the
+    trailing "Z" made exact-string comparison against the UI's un-suffixed
+    timestamps always fail, and because for capture times close to local
+    midnight, the UTC value could land on the wrong calendar day entirely once
+    converted. `round0.py`'s `_read_sidecar_ts` now converts to
+    `ACCOUNT_TIMEZONE` (env var, default `Europe/Amsterdam`) and stores a naive
+    string, matching EXIF's format. Don't reintroduce UTC storage for sidecar
+    timestamps without re-verifying the UI still shows local time with no
+    offset marker.
 
 ## Things to ask the user about before proceeding
 

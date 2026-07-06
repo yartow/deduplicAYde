@@ -13,6 +13,17 @@ Timestamp resolution (in priority order):
   Filesystem mtime/ctime are NEVER used — Takeout extraction corrupts them.
   Files with neither source are logged as `no_timestamp` for manual review.
 
+local_timestamp is always stored as a naive "YYYY-MM-DDTHH:MM:SS" string in the
+Google Photos account's own local display timezone (ACCOUNT_TIMEZONE env var,
+default Europe/Amsterdam) — confirmed live that locate_stage.py's day-search/
+matching against the UI (which shows local time, no timezone indicator) failed
+for 100% of sidecar-sourced items otherwise: Takeout sidecars only give a UTC
+epoch, and storing that as UTC (with a trailing "Z") both broke exact-string
+matching against the UI's timestamps and, for times close to local midnight,
+shifted some items into the wrong calendar day entirely. EXIF DateTimeOriginal
+has no timezone info and is assumed to already be local capture time, so it's
+left as-is.
+
 Run:
     docker compose run cli round0
     docker compose run cli round0 --limit=200   # small smoke test
@@ -22,11 +33,14 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from tqdm import tqdm
 
 from . import db
 from .logger import log_info, log_item
+
+_ACCOUNT_TZ = ZoneInfo(os.environ.get("ACCOUNT_TIMEZONE", "Europe/Amsterdam"))
 
 # exifread logs "File format not recognized." / "<X> file does not have exif
 # data." at WARNING level for every non-JPEG/TIFF/HEIC/WEBP/PNG-with-exif file
@@ -88,13 +102,16 @@ def _parse_exif_str(raw: str) -> str | None:
 
 
 def _read_sidecar_ts(sidecar: Path) -> str | None:
+    """Return photoTakenTime converted to ACCOUNT_TZ, naive (no "Z"/offset) —
+    matching EXIF's format so every local_timestamp is directly comparable to
+    what Google Photos displays, regardless of source."""
     try:
         with open(sidecar) as f:
             data = json.load(f)
         ts_str = data.get("photoTakenTime", {}).get("timestamp")
         if ts_str:
-            dt = datetime.fromtimestamp(int(ts_str), tz=timezone.utc)
-            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            dt = datetime.fromtimestamp(int(ts_str), tz=timezone.utc).astimezone(_ACCOUNT_TZ)
+            return dt.strftime("%Y-%m-%dT%H:%M:%S")
     except Exception:
         pass
     return None
@@ -129,7 +146,8 @@ def _sidecar_dir_index(directory: Path) -> dict[str, Path]:
 
 
 def _sidecar_timestamp(path: Path) -> str | None:
-    """Return photoTakenTime from a Takeout JSON sidecar as ISO UTC, or None.
+    """Return photoTakenTime from a Takeout JSON sidecar, converted to
+    ACCOUNT_TZ and naive (see _read_sidecar_ts), or None.
 
     Takeout places sidecar files alongside the media file, using either
     "photo.jpg.json" or (for long filenames) "photo.json" — or, when the

@@ -14,6 +14,7 @@ services:
       - EDGE_THRESHOLD=${EDGE_THRESHOLD:-0.05}
       - OCR_DENSITY_THRESHOLD=${OCR_DENSITY_THRESHOLD:-0.001}
       - PHASH_HAMMING_THRESHOLD=${PHASH_HAMMING_THRESHOLD:-10}
+      - ACCOUNT_TIMEZONE=${ACCOUNT_TIMEZONE:-Europe/Amsterdam}
     working_dir: /app
     entrypoint: ["python", "-m", "deduplicayde.cli"]
     command: ["status"]
