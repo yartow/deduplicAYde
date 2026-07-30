@@ -42,7 +42,7 @@ services:
       context: .
       dockerfile: docker/Dockerfile.review
     volumes:
-      - "${DATA_DIR:-./data}:/data:ro"
+      - "${DATA_DIR:-./data}:/data"
     ports:
       - "8000:8000"
     environment:
@@ -50,3 +50,37 @@ services:
       - PYTHONUNBUFFERED=1
     working_dir: /app
     entrypoint: ["python", "-m", "deduplicayde.review_app"]
+
+  quality:
+    # CPU-only fallback for quality-score (QUALITY_SCORING_DOCKER=true, the
+    # default). For real GPU throughput on Apple Silicon, set
+    # QUALITY_SCORING_DOCKER=false and use scripts/run_quality_score.sh
+    # instead (Docker Desktop has no Metal/ANE passthrough — see CLAUDE.md).
+    #
+    # cpus/mem_limit: confirmed live this cap is load-bearing, not
+    # precautionary — a `--tier heavyweight` run through this path (no cap)
+    # let PyTorch pin every core Docker Desktop's Linux VM had (up to 10 on
+    # an M1 Max, per `--cpus 10` in the VM's launch args), sustained for the
+    # whole run. That's exactly the kind of load that stops a laptop from
+    # completing lid-close sleep and builds up heat while enclosed — it
+    # coincided with a real crash/overheat. Capping cpus here bounds worst
+    # case heat output regardless of tier or thread env vars inside the
+    # container. Don't remove this without an equivalent safeguard.
+    cpus: 4
+    mem_limit: 6g
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.quality
+    volumes:
+      - "${DATA_DIR:-./data}:/data"
+      - "quality_model_cache:/root/.cache/torch"
+    environment:
+      - DATA_DIR=/data
+      - PYTHONUNBUFFERED=1
+      - QUALITY_TIER=${QUALITY_TIER:-medium}
+    working_dir: /app
+    entrypoint: ["python", "-m", "deduplicayde.cli"]
+    command: ["quality-score", "--help"]
+
+volumes:
+  quality_model_cache:

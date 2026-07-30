@@ -1,9 +1,11 @@
-"""Round 4 review web app: side-by-side full-resolution duplicate comparison.
+"""Round 4 review web app: side-by-side full-resolution duplicate comparison,
+plus a /vague grid for eyeballing the blur/edge threshold before committing to
+it with `vague-threshold --apply` (see vague_threshold.py).
 
 Start: docker compose up review
 Open:  http://localhost:8000
 
-Keyboard shortcuts:
+Keyboard shortcuts (duplicate review):
   A     → keep left, delete right
   D     → keep right, delete left
   S     → keep both / not duplicates
@@ -17,8 +19,12 @@ from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse
 import uvicorn
 
 from . import db
+from .thresholds import BLUR_THRESHOLD as _BLUR_THRESHOLD
+from .thresholds import EDGE_THRESHOLD as _EDGE_THRESHOLD
+from .thresholds import OCR_DENSITY_THRESHOLD as _OCR_DENSITY_THRESHOLD
 
 _DATA_DIR = os.environ.get("DATA_DIR", "/data")
+_VAGUE_PAGE_SIZE = 30
 
 app = FastAPI(title="deduplicAYde Review", docs_url=None, redoc_url=None)
 
@@ -51,6 +57,7 @@ a.btn:hover {{ background:#1557b0; }}
   <b>{pending}</b> pairs pending review &nbsp;|&nbsp; <b>{done}</b> reviewed
 </div>
 <a class="btn" href="/review">Start Reviewing →</a>
+<a class="btn" href="/vague" style="background:#e8710a;">Browse vague candidates →</a>
 </body></html>""")
 
 
@@ -208,6 +215,113 @@ def record_decision(pair_id: int, decision: str):
             )
 
     return RedirectResponse("/review", status_code=303)
+
+
+@app.get("/vague", response_class=HTMLResponse)
+def vague_preview(blur: float = _BLUR_THRESHOLD, edge: float = _EDGE_THRESHOLD, page: int = 0):
+    """Grid of items that WOULD be labeled 'vague' at the given blur/edge cutoff —
+    read-only, for eyeballing a threshold before committing to it via
+    `vague-threshold --blur-threshold ... --edge-threshold ... --apply`
+    (see vague_threshold.py). Sorted blurriest-first so the most confidently
+    vague candidates show up on page 0.
+    """
+    offset = max(page, 0) * _VAGUE_PAGE_SIZE
+
+    with db.get_conn() as conn:
+        total = conn.execute(
+            """
+            SELECT COUNT(*) FROM media_items
+            WHERE blur_score IS NOT NULL AND edge_density IS NOT NULL
+              AND (label IS NULL OR label != 'receipt')
+              AND (ocr_text_density IS NULL OR ocr_text_density <= ?)
+              AND blur_score < ? AND edge_density < ?
+              AND deletion_status IS NULL
+            """,
+            (_OCR_DENSITY_THRESHOLD, blur, edge),
+        ).fetchone()[0]
+
+        rows = conn.execute(
+            """
+            SELECT id, filename, blur_score, edge_density
+            FROM media_items
+            WHERE blur_score IS NOT NULL AND edge_density IS NOT NULL
+              AND (label IS NULL OR label != 'receipt')
+              AND (ocr_text_density IS NULL OR ocr_text_density <= ?)
+              AND blur_score < ? AND edge_density < ?
+              AND deletion_status IS NULL
+            ORDER BY blur_score ASC, id ASC
+            LIMIT ? OFFSET ?
+            """,
+            (_OCR_DENSITY_THRESHOLD, blur, edge, _VAGUE_PAGE_SIZE, offset),
+        ).fetchall()
+
+    def esc(s: str) -> str:
+        return (s or "").replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
+
+    cards = "\n".join(f"""
+      <div class="card">
+        <img src="/img/{r['id']}" loading="lazy">
+        <div class="card-meta" title="{esc(r['filename'])}">
+          {esc(r['filename'])}<br>blur={r['blur_score']:.1f} edge={r['edge_density']:.4f}
+        </div>
+      </div>
+    """ for r in rows)
+
+    has_next = offset + _VAGUE_PAGE_SIZE < total
+    has_prev = page > 0
+    showing_from = 0 if total == 0 else offset + 1
+    showing_to = min(offset + _VAGUE_PAGE_SIZE, total)
+
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Vague candidates – deduplicAYde</title>
+<style>
+* {{ box-sizing: border-box; }}
+body {{ font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 0; }}
+header {{ padding: 1rem; background: #222; position: sticky; top: 0; z-index: 1; }}
+header h1 {{ font-size: 1.1rem; margin-bottom: 0.5rem; }}
+form {{ display: flex; gap: 0.8rem; align-items: center; flex-wrap: wrap; font-size: 0.85rem; }}
+label {{ display: flex; gap: 0.4rem; align-items: center; }}
+input {{ width: 6rem; padding: 0.2rem 0.4rem; }}
+button, a.nav {{ padding: 0.4rem 0.9rem; border: none; border-radius: 6px; background: #e8710a;
+       color: white; cursor: pointer; text-decoration: none; font-size: 0.85rem; }}
+.count {{ color: #aaa; margin-left: auto; font-size: 0.85rem; }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+         gap: 1rem; padding: 1rem; }}
+.card {{ background: #1e1e1e; border-radius: 6px; overflow: hidden; }}
+.card img {{ width: 100%; height: 220px; object-fit: cover; display: block; }}
+.card-meta {{ padding: 0.4rem 0.6rem; font-size: 0.7rem; color: #ccc;
+              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+.pager {{ display: flex; justify-content: center; gap: 1rem; padding: 1rem; }}
+.hint {{ padding: 0 1rem 1rem; color: #888; font-size: 0.8rem; }}
+code {{ background: #222; padding: 0.1rem 0.3rem; border-radius: 3px; }}
+</style>
+</head>
+<body>
+<header>
+  <h1>Vague candidates — read-only preview, nothing is deleted here</h1>
+  <form method="get" action="/vague">
+    <label>Blur &lt; <input type="number" step="1" name="blur" value="{blur}"></label>
+    <label>Edge &lt; <input type="number" step="0.001" name="edge" value="{edge}"></label>
+    <button type="submit">Apply preview</button>
+    <span class="count">Showing {showing_from}-{showing_to} of {total} candidates at this cutoff</span>
+  </form>
+</header>
+
+<div class="grid">
+  {cards or '<p style="padding:1rem;color:#888;">No candidates at this cutoff.</p>'}
+</div>
+
+<div class="pager">
+  {f'<a class="nav" href="/vague?blur={blur}&edge={edge}&page={page-1}">← Prev</a>' if has_prev else ''}
+  {f'<a class="nav" href="/vague?blur={blur}&edge={edge}&page={page+1}">Next →</a>' if has_next else ''}
+</div>
+
+<div class="hint">
+  Happy with this cutoff? Run it for real from the CLI:<br>
+  <code>docker compose run --rm cli vague-threshold --blur-threshold {blur} --edge-threshold {edge} --apply</code>
+</div>
+</body></html>""")
 
 
 @app.get("/img/{item_id:int}")

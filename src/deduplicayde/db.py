@@ -36,6 +36,12 @@ CREATE TABLE IF NOT EXISTS media_items (
     edge_density   REAL,
     ocr_text_density REAL,
     label          TEXT,    -- receipt | vague | ok | NULL (unprocessed)
+    -- AI no-reference image-quality score (quality-score command; native or
+    -- Docker `quality` service — see QUALITY_SCORING_DOCKER in .env). A
+    -- second signal alongside blur_score/edge_density, not a replacement.
+    quality_score      REAL,   -- pyiqa metric output; range/polarity depends on quality_model
+    quality_model      TEXT,   -- exact pyiqa model id used (e.g. 'musiq', 'clipiqa+_vitL14_512')
+    quality_scored_at  TEXT,
     -- staging (Playwright-confirmed add-to-album)
     staged_album_id TEXT,
     staged_at       TEXT,
@@ -108,10 +114,13 @@ def init_db() -> None:
 def _migrate(conn: sqlite3.Connection) -> None:
     """Add columns introduced after the initial schema so existing DBs stay compatible."""
     existing = {r[1] for r in conn.execute("PRAGMA table_info(media_items)").fetchall()}
-    for col, col_type in []:
+    for col, col_type in [
+        ("quality_score", "REAL"),
+        ("quality_model", "TEXT"),
+        ("quality_scored_at", "TEXT"),
+    ]:
         if col not in existing:
             conn.execute(f"ALTER TABLE media_items ADD COLUMN {col} {col_type}")
-    _ = existing  # no pending additive migrations right now
 
 
 @contextmanager
@@ -186,6 +195,29 @@ def set_detection_result(
             label=?, updated_at=?
            WHERE id=?""",
         (blur_score, edge_density, ocr_text_density, label, now_iso(), item_id),
+    )
+
+
+def set_label(conn: sqlite3.Connection, item_id: int, label: str) -> None:
+    """Re-derive label from already-stored blur_score/edge_density under a new
+    threshold, without re-running detection. Used by vague_threshold.py."""
+    conn.execute(
+        "UPDATE media_items SET label=?, updated_at=? WHERE id=?",
+        (label, now_iso(), item_id),
+    )
+
+
+def set_quality_score(
+    conn: sqlite3.Connection,
+    item_id: int,
+    quality_score: float,
+    quality_model: str,
+) -> None:
+    conn.execute(
+        """UPDATE media_items SET
+            quality_score=?, quality_model=?, quality_scored_at=?, updated_at=?
+           WHERE id=?""",
+        (quality_score, quality_model, now_iso(), now_iso(), item_id),
     )
 
 

@@ -5,6 +5,7 @@ imagehash==4.3.1
 Pillow==10.3.0
 pillow-heif==0.16.0
 exifread==3.0.0
+timezonefinder==6.5.2
 google-api-python-client==2.130.0
 google-auth-httplib2==0.2.0
 google-auth-oauthlib==1.2.0

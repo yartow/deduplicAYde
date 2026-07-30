@@ -5,7 +5,32 @@ overall design; this file covers implementation conventions and guardrails.
 
 ## Tech stack
 
-- **Python 3.12**, run only inside Docker containers (never installed on the host).
+- **Python 3.12**, run only inside Docker containers (never installed on the
+  host) — **except the `quality-score` AI image-quality step**, which may
+  optionally run natively in a host venv (`.venv-quality/`, Python 3.13 or
+  3.14 — see `scripts/setup_quality_native_env.sh`). Reason: Docker Desktop
+  on Apple Silicon runs containers inside a Linux VM with no Metal/Neural-
+  Engine passthrough, so a GPU-accelerated model inside a container silently
+  falls back to CPU. Controlled by `QUALITY_SCORING_DOCKER` in `.env`
+  (default `true` = Docker, CPU-only, matches every other step's behavior);
+  set to `false` to opt into native execution via PyTorch's `mps` backend on
+  the host GPU. This is the only step allowed to touch host Python or write
+  outside `DATA_DIR`/the repo (pretrained weights cache to the host's
+  `~/.cache/torch`, same directory PyTorch always uses) — don't extend either
+  exception to any other command without discussing it first.
+  **Confirmed live, a real gotcha for this step specifically**: `local_path`
+  in `media_items` is always stored `/data/`-prefixed, because every other
+  round (0-4) runs inside a Docker container where `DATA_DIR=/data` is the
+  bind-mount target — that prefix is only ever valid inside a container.
+  `quality-score` is the first code path that can run natively, where
+  `DATA_DIR` is the *real* host path instead, so `/data/...` doesn't exist
+  there at all — every eligible-file lookup silently returned zero results
+  until `quality_score.py::_resolve_local_path` was added to re-root the
+  stored path onto the real `DATA_DIR` when the two differ (a no-op inside
+  Docker, where they're the same). Any future native code path reading
+  `local_path` needs this same re-rooting — it's not specific to
+  quality-score's logic, it's a property of how every path in the DB was
+  written.
 - **OpenCV** (`opencv-python-headless`) for blur/edge detection.
 - **Tesseract OCR** (`pytesseract` + the `tesseract-ocr` apt package) for receipt
   text-density detection.
@@ -44,6 +69,23 @@ overall design; this file covers implementation conventions and guardrails.
 - **Docker Compose** with at least two services: `cli` (batch rounds) and `review`
   (the Round 4 web app). Decide during Round 0 whether the Playwright deletion step
   needs its own service with a noVNC port exposed, or can share the `cli` service.
+- **pyiqa (IQA-PyTorch) + PyTorch** for the optional `quality-score` step's
+  AI no-reference image-quality scoring — a second signal alongside
+  `blur_score`/`edge_density` (see architecture rule 11), run either in the
+  CPU-only `quality` Docker service or natively via PyTorch's `mps` backend
+  (see tech-stack bullet 1 above). Two tiers, chosen via `--tier`/
+  `QUALITY_TIER`: `medium` (`musiq`) and `heavyweight`
+  (`clipiqa+_vitL14_512`, a full CLIP ViT-L/14 backbone at 512px — much
+  slower, especially on CPU). Verify exact pyiqa model-id strings against
+  `pyiqa.list_models(metric_mode='NR')` before relying on them; pyiqa's
+  registry has changed spelling/availability across releases. Confirmed live:
+  pyiqa's `imread2pil` only accepts a path string, bytes, or a `PIL.Image`
+  (not a raw array) and reads via `PIL.Image.open()` internally even for
+  path strings — so every image is pre-loaded as a PIL Image and passed in
+  directly (`quality_score.py::_load_image_pil`), with `pillow_heif.
+  register_heif_opener()` called once at module import so `.heic`/`.heif`
+  files open correctly (mirroring why `detection.py`'s `_open_cv_image`
+  needs the same registration for its own separate cv2-based path).
 
 ## Architecture rules
 
@@ -120,6 +162,14 @@ overall design; this file covers implementation conventions and guardrails.
     string, matching EXIF's format. Don't reintroduce UTC storage for sidecar
     timestamps without re-verifying the UI still shows local time with no
     offset marker.
+11. **`quality-score --sample N` never writes to the DB.** Unlike
+    `round0 --limit` (which processes real, DB-persisted rows), `--sample`
+    draws a *random* subset (`random.sample`, not first-N) purely to preview
+    timing and output quality before committing to a full run over the whole
+    library. It writes only a self-contained HTML report to `DATA_DIR/logs/`
+    (matches rule 3's dry-run-by-default spirit even though this command
+    isn't destructive). Only the full (`--sample`-less) run writes
+    `quality_score`/`quality_model`/`quality_scored_at` to `media_items`.
 
 ## Things to ask the user about before proceeding
 
@@ -137,6 +187,47 @@ overall design; this file covers implementation conventions and guardrails.
   full library for the first time.
 - Before installing any new system dependency that isn't already covered by the
   Docker images.
+- Before running `quality-score --tier heavyweight` for the first time: it
+  downloads a large pretrained checkpoint (CLIP ViT-L/14, order of 1-2GB) —
+  confirm there's room and patience before running it unattended over the
+  full library.
+- Before any `quality-score` run that will execute on CPU (the Docker path,
+  `QUALITY_SCORING_DOCKER=true`, always; or the native path if `mps` isn't
+  available): tell the user explicitly not to close the lid or put the
+  laptop away while it runs. **Confirmed live**: an uncapped `--tier
+  heavyweight` run through the Docker `quality` service let PyTorch pin
+  every core Docker Desktop's Linux VM had access to (up to 10 on an M1 Max
+  — `com.docker.virtualization --cpus 10`), sustained for the whole run,
+  and that coincided with a real overheat/crash while the lid was closed.
+  `quality` now has a hard `cpus`/`mem_limit` cap in `docker-compose.yml`
+  and `quality_score.py` caps `OMP_NUM_THREADS`/`MKL_NUM_THREADS`/
+  `torch.set_num_threads` (`QUALITY_MAX_CPU_THREADS` env var to override,
+  default cpu_count-2) and prints a warning before any CPU-bound run — but
+  those bound the worst case, they don't make sustained load safe to leave
+  enclosed. Don't remove or loosen these caps without an equivalent
+  safeguard, and always surface the warning to the user rather than
+  suppressing it.
+- **A second, distinct incident, confirmed live**: even on the `mps` (GPU)
+  path — no CPU pinning, exactly the "safe" path above — a `--tier
+  heavyweight` (`clipiqa+_vitL14_512`) run raised `Invalid buffer size:
+  493.81 GiB` on an ordinary 18-megapixel JPEG (5184x3456, nothing wrong
+  with the file). That number matches a ViT self-attention matrix sized off
+  the raw image's patch grid rather than the model's 512px working
+  resolution — some path in pyiqa's preprocessing wasn't downsizing first.
+  The *attempted* allocation (not just the eventual exception) is what
+  caused a 13-minute stall and system-wide swap-thrashing/keystroke lag
+  reported live — by the time the exception is caught, the memory-pressure
+  damage is already done, so the existing per-item try/except couldn't have
+  prevented it. Fixed by capping every image's longest side to
+  `QUALITY_MAX_IMAGE_DIM` (default 1024px, via `PIL.Image.thumbnail`) in
+  `_load_image_pil` *before* it ever reaches pyiqa, applied unconditionally
+  to every tier/model — plus a `SIGALRM`-based per-item timeout
+  (`QUALITY_ITEM_TIMEOUT_SECONDS`, default 60s) in `_score_one` as a
+  backstop for any other stall this specific fix doesn't cover (the alarm
+  can't preempt a single already-in-flight C-level call like a stuck
+  malloc, so it's a backstop, not the primary fix). Don't remove the resize
+  cap without re-verifying this specific model/pyiqa-version combination no
+  longer needs it.
 
 ## Things NOT to do
 
@@ -144,7 +235,10 @@ overall design; this file covers implementation conventions and guardrails.
   endpoint — it doesn't exist for arbitrary library items; don't go looking for
   workarounds that violate Google's ToS (e.g. reverse-engineered internal APIs).
 - Don't write anything to the host filesystem outside the mounted `DATA_DIR` and
-  the repo itself.
+  the repo itself — except `quality-score`'s native path, which writes
+  `.venv-quality/` inside the repo and caches pretrained weights to the
+  host's `~/.cache/torch` (PyTorch's own standard cache location); see
+  tech-stack bullet 1.
 - Don't auto-empty the Trash without an explicit separate command/flag — the
   60-day recovery window is intentional safety margin.
 - Don't build this as a long-running background daemon; it should be explicit,
