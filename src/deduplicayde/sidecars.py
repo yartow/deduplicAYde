@@ -8,6 +8,7 @@ timestamp handling (ACCOUNT_TIMEZONE, naive local storage).
 """
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -47,9 +48,35 @@ def invalidate_dir_index(directory: Path) -> None:
 
     Callers that rewrite a sidecar's "title" field (reorganize.py, after a
     collision rename) or move files in/out of a directory must call this so
-    a later lookup in the same process doesn't serve a stale mapping.
+    a later lookup in the same process doesn't serve a stale mapping. Prefer
+    drop_from_dir_index/add_to_dir_index when only one entry actually
+    changed — see their docstrings for why a wholesale drop is expensive at
+    this library's directory sizes.
     """
     _SIDECAR_TITLE_INDEX.pop(directory, None)
+
+
+def drop_from_dir_index(directory: Path, title: str) -> None:
+    """Remove one moved-away sidecar from a cached index, instead of dropping
+    the whole index. Rebuilding via sidecar_dir_index() re-globs and
+    re-parses every *.json in the directory — measured live at 13k-38k files
+    in this library's largest "Photos from YYYY" folders, so doing that once
+    per moved file (as invalidate_dir_index did) is O(n^2) over a run and was
+    the actual cause of reorganize.py's ETA climbing past 130 hours. Safe to
+    call even if the directory isn't cached yet (no-op)."""
+    idx = _SIDECAR_TITLE_INDEX.get(directory)
+    if idx is not None:
+        idx.pop(title.lower(), None)
+
+
+def add_to_dir_index(directory: Path, title: str, sidecar: Path) -> None:
+    """Register a sidecar moved *into* an already-cached directory, so a
+    later lookup in the same directory (e.g. a different file's -edited
+    fallback) sees it without a full rebuild. No-op if the directory isn't
+    cached yet — it'll be built fresh, correctly, on first real lookup."""
+    idx = _SIDECAR_TITLE_INDEX.get(directory)
+    if idx is not None:
+        idx[title.lower()] = sidecar
 
 
 def read_sidecar_ts(sidecar: Path) -> str | None:
@@ -86,6 +113,14 @@ def find_sidecar(path: Path) -> Path | None:
     in-app edits — the edit doesn't change capture time or geo, so fall back
     to the original's sidecar).
 
+    A reorganize.py collision rename (e.g. "IMG_1234-edited_1.JPG") appends
+    "_N" after "-edited", which used to defeat the plain endswith("-edited")
+    check below — confirmed live on a full-library reorganize run, where
+    two physically distinct "-edited" files (same name, different Takeout
+    source folders) landed in the same date folder and the second one, after
+    being collision-renamed, silently lost its sidecar fallback. The trailing
+    "_N" is stripped before the "-edited" check so this still resolves.
+
     Unlike round0's own _sidecar_timestamp, this does not require the found
     sidecar to actually contain a usable photoTakenTime — callers here also
     want geoData and the "title" field regardless of timestamp validity.
@@ -100,8 +135,9 @@ def find_sidecar(path: Path) -> Path | None:
     if sidecar:
         return sidecar
 
-    if path.stem.endswith("-edited"):
-        original = path.with_name(path.stem[: -len("-edited")] + path.suffix)
+    destemmed = re.sub(r"_\d+$", "", path.stem)
+    if destemmed.endswith("-edited"):
+        original = path.with_name(destemmed[: -len("-edited")] + path.suffix)
         if original != path:
             return find_sidecar(original)
 

@@ -59,6 +59,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -291,7 +292,123 @@ def _db_local_path(path: Path) -> str:
     return str(path)
 
 
+_LOCK_PATH = _LOGS_DIR / ".reorganize.lock"
+
+
+class _AlreadyRunningError(RuntimeError):
+    pass
+
+
+def _acquire_lock() -> None:
+    """Refuse to start a second concurrent run against the same library.
+
+    Confirmed live: a previous run's host-side `docker compose` process
+    exited (session ended) while its *container* kept executing detached;
+    starting what looked like a fresh run later added a second mover racing
+    the first over the same files. os.replace() overwrites its destination
+    unconditionally, so two processes resolving the same free destination
+    name before either moves can silently destroy one of them — the
+    in-process `reserved` set in _unique_path can't protect against another
+    process. O_CREAT | O_EXCL is atomic even over the virtiofs bind mount
+    this runs on, unlike a check-then-write pattern.
+    """
+    _LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        holder = "unknown"
+        try:
+            holder = _LOCK_PATH.read_text().strip()
+        except OSError:
+            pass
+        raise _AlreadyRunningError(
+            f"Another reorganize run appears to be in progress (lock held by: {holder}). "
+            f"If that run has actually exited, remove {_LOCK_PATH} by hand and try again."
+        )
+    with os.fdopen(fd, "w") as f:
+        f.write(f"pid={os.getpid()} started={datetime.now(timezone.utc).isoformat()}\n")
+
+
+def _release_lock() -> None:
+    try:
+        _LOCK_PATH.unlink()
+    except OSError:
+        pass
+
+
+def _write_manifest_from_log() -> Path:
+    """(Re)build albums_manifest.csv from every moved_*/quarantined line in
+    this round's jsonl logs, instead of accumulating rows in memory across
+    the whole run.
+
+    Building it only at the very end (in memory) meant a stop mid-run — even
+    a clean one, e.g. to apply a fix like this lock — lost every row
+    recorded so far, with no way to recover which album folders the moved
+    files had come from once those folders are later deleted in cleanup.
+    The jsonl log already carries src/dest/renamed/date_source for every
+    successful move (log_item calls above), across *all* runs/restarts on
+    this library, so rebuilding from it instead is both crash-safe and
+    strictly more complete.
+    """
+    manifest_path = _LOGS_DIR / "albums_manifest.csv"
+    rows: dict[str, dict] = {}  # keyed on old_path; entries are applied in
+                                 # chronological (file-then-line) order, so a
+                                 # later real moved_*/quarantined outcome
+                                 # naturally supersedes an earlier dry-run
+                                 # would_move_*/would_quarantine preview for
+                                 # the same source path.
+    for log_path in sorted(_LOGS_DIR.glob(f"{_ROUND}_*.jsonl")):
+        with open(log_path) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                outcome = entry.get("outcome", "")
+                if outcome in ("quarantined", "would_quarantine"):
+                    date_source = "none"
+                elif outcome.startswith("moved_"):
+                    date_source = outcome.removeprefix("moved_")
+                elif outcome.startswith("would_move_"):
+                    date_source = outcome.removeprefix("would_move_")
+                else:
+                    continue
+                src = entry.get("src")
+                if not src:
+                    continue
+                album_title, album_date = _album_info(Path(src).parent)
+                rows[src] = {
+                    "old_path": src,
+                    "album_title": album_title,
+                    "album_date": album_date,
+                    "new_path": entry.get("dest", ""),
+                    "renamed": entry.get("renamed", False),
+                    "date_source": date_source,
+                }
+
+    with open(manifest_path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["old_path", "album_title", "album_date", "new_path", "renamed", "date_source"]
+        )
+        writer.writeheader()
+        writer.writerows(rows.values())
+    return manifest_path
+
+
 def run(dry_run: bool = True, limit: int | None = None) -> None:
+    # Only the real, file-moving run needs the cross-process lock: a dry run
+    # touches nothing on disk or in the DB, so it's safe (and useful) to run
+    # concurrently with an in-progress real run to check progress.
+    if not dry_run:
+        _acquire_lock()
+    try:
+        _run(dry_run=dry_run, limit=limit)
+    finally:
+        if not dry_run:
+            _release_lock()
+
+
+def _run(dry_run: bool, limit: int | None) -> None:
     db.init_db()
     log_info(_ROUND, "Starting reorganize: sorting library into date folders", dry_run=dry_run)
 
@@ -301,8 +418,6 @@ def run(dry_run: bool = True, limit: int | None = None) -> None:
     print(f"Media files found: {total}")
 
     _LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    manifest_path = _LOGS_DIR / "albums_manifest.csv"
-    manifest_rows: list[dict] = []
 
     counts = {
         "already_organized": 0, "moved_exif": 0, "moved_sidecar": 0,
@@ -313,6 +428,17 @@ def run(dry_run: bool = True, limit: int | None = None) -> None:
     # a companion move and its media file's own move). See _unique_path.
     reserved: set[str] = set()
     processed = 0
+
+    # One long-lived connection for the whole run instead of open+commit+
+    # close per file (db.get_conn()'s normal per-call pattern): at this
+    # library's scale that meant one fsync-ing commit per file over the
+    # virtiofs bind mount, a real contributor to the run's slowness. Commit
+    # every 500 moves instead (CLAUDE.md rule 7's checkpoint interval) plus
+    # once more at the very end.
+    db_conn = sqlite3.connect(db.DB_PATH, check_same_thread=False) if not dry_run else None
+    if db_conn is not None:
+        db_conn.row_factory = sqlite3.Row
+        db_conn.execute("PRAGMA foreign_keys=ON")
 
     with tqdm(desc="reorganize", unit=" files", total=total) as bar:
         for path in files:
@@ -351,17 +477,22 @@ def run(dry_run: bool = True, limit: int | None = None) -> None:
                         os.replace(comp, comp_dest)
                         if comp.suffix.lower() == ".json":
                             _rewrite_sidecar_title(comp_dest, dest_media.name)
-                            sidecars.invalidate_dir_index(orig_parent)
+                            # Surgical index update, not invalidate_dir_index:
+                            # a full rebuild re-parses every *.json in the
+                            # source directory (13k-38k files in this
+                            # library's largest folders) on every single
+                            # move, which is what actually caused the ETA to
+                            # blow up past 130 hours. See sidecars.py.
+                            sidecars.drop_from_dir_index(orig_parent, path.name)
+                            sidecars.add_to_dir_index(dest_dir, dest_media.name, comp_dest)
                     os.replace(path, dest_media)
 
-                    row = None
-                    with db.get_conn() as conn:
-                        row = conn.execute(
-                            "SELECT id FROM media_items WHERE local_path=?",
-                            (_db_local_path(path),),
-                        ).fetchone()
-                        if row:
-                            db.update_local_path(conn, row["id"], _db_local_path(dest_media))
+                    row = db_conn.execute(
+                        "SELECT id FROM media_items WHERE local_path=?",
+                        (_db_local_path(path),),
+                    ).fetchone()
+                    if row:
+                        db.update_local_path(db_conn, row["id"], _db_local_path(dest_media))
 
                     outcome = "quarantined" if source == "none" else f"moved_{source}"
                     log_item(
@@ -380,27 +511,18 @@ def run(dry_run: bool = True, limit: int | None = None) -> None:
             if renamed:
                 counts["renamed"] += 1
 
-            album_title, album_date = _album_info(orig_parent)
-            manifest_rows.append({
-                "old_path": str(path),
-                "album_title": album_title,
-                "album_date": album_date,
-                "new_path": str(dest_media),
-                "renamed": renamed,
-                "date_source": source,
-            })
-
             processed += 1
+            if db_conn is not None and processed % 500 == 0:
+                db_conn.commit()
             if limit and processed >= limit:
                 log_info(_ROUND, "Reached --limit, stopping", limit=limit)
                 break
 
-    with open(manifest_path, "w", newline="") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["old_path", "album_title", "album_date", "new_path", "renamed", "date_source"]
-        )
-        writer.writeheader()
-        writer.writerows(manifest_rows)
+    if db_conn is not None:
+        db_conn.commit()
+        db_conn.close()
+
+    manifest_path = _write_manifest_from_log()
 
     folders_deleted = 0
     if not dry_run:

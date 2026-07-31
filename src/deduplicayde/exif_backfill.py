@@ -200,7 +200,53 @@ def build_csv(limit: int | None = None) -> tuple[Path, int]:
     return csv_path, len(rows)
 
 
+_LOCK_PATH = _LOGS_DIR / ".exif_backfill.lock"
+
+
+class _AlreadyRunningError(RuntimeError):
+    pass
+
+
+def _acquire_lock() -> None:
+    """Same rationale as reorganize.py's lock: refuse to start a second
+    concurrent apply pass. Only guards --no-dry-run, since the dry-run CSV
+    build touches no image file and is safe to run alongside anything."""
+    _LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        holder = "unknown"
+        try:
+            holder = _LOCK_PATH.read_text().strip()
+        except OSError:
+            pass
+        raise _AlreadyRunningError(
+            f"Another exif-backfill run appears to be in progress (lock held by: {holder}). "
+            f"If that run has actually exited, remove {_LOCK_PATH} by hand and try again."
+        )
+    with os.fdopen(fd, "w") as f:
+        from datetime import datetime as _dt
+        f.write(f"pid={os.getpid()} started={_dt.now(timezone.utc).isoformat()}\n")
+
+
+def _release_lock() -> None:
+    try:
+        _LOCK_PATH.unlink()
+    except OSError:
+        pass
+
+
 def run(dry_run: bool = True, limit: int | None = None) -> None:
+    if not dry_run:
+        _acquire_lock()
+    try:
+        _run(dry_run=dry_run, limit=limit)
+    finally:
+        if not dry_run:
+            _release_lock()
+
+
+def _run(dry_run: bool, limit: int | None) -> None:
     db.init_db()
     log_info(_ROUND, "Starting exif-backfill", dry_run=dry_run)
 

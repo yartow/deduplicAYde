@@ -51,12 +51,20 @@ def cmd_round0(args) -> None:
 
 def cmd_reorganize(args) -> None:
     from . import reorganize
-    reorganize.run(dry_run=args.dry_run, limit=args.limit)
+    try:
+        reorganize.run(dry_run=args.dry_run, limit=args.limit)
+    except reorganize._AlreadyRunningError as e:
+        print(f"\nError: {e}")
+        raise SystemExit(1)
 
 
 def cmd_exif_backfill(args) -> None:
     from . import exif_backfill
-    exif_backfill.run(dry_run=args.dry_run, limit=args.limit)
+    try:
+        exif_backfill.run(dry_run=args.dry_run, limit=args.limit)
+    except exif_backfill._AlreadyRunningError as e:
+        print(f"\nError: {e}")
+        raise SystemExit(1)
 
 
 def cmd_round1(_args) -> None:
