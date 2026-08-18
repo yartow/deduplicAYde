@@ -457,12 +457,19 @@ def _add_selection_to_album(page, album_title: str) -> None:
             )
     time.sleep(0.5)
 
+    # Same hover-hidden pattern as the kebab above — confirmed live
+    # (2026-07-05/06) via repeated real "waiting for locator(...option...)"
+    # timeouts on this exact line across an 11-occurrence sample in a long
+    # unattended run, so both of these get reveal()/click() too rather than
+    # a plain .click().
     album_menu_item = page.locator("[role='menuitem'][aria-label='Album']").first
-    album_menu_item.click(timeout=5_000)
+    browser.reveal(page, album_menu_item)
+    browser.click(album_menu_item)
     time.sleep(0.5)
 
     album_option = page.locator(f"[role='option'][aria-label*='{album_title}']").first
-    album_option.click(timeout=5_000)
+    browser.reveal(page, album_option)
+    browser.click(album_option)
     time.sleep(1)
 
 

@@ -28,19 +28,15 @@ Run:
     docker compose run cli round0
     docker compose run cli round0 --limit=200   # small smoke test
 """
-import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from tqdm import tqdm
 
-from . import db
+from . import db, sidecars
 from .logger import log_info, log_item
-
-_ACCOUNT_TZ = ZoneInfo(os.environ.get("ACCOUNT_TIMEZONE", "Europe/Amsterdam"))
 
 # exifread logs "File format not recognized." / "<X> file does not have exif
 # data." at WARNING level for every non-JPEG/TIFF/HEIC/WEBP/PNG-with-exif file
@@ -101,53 +97,11 @@ def _parse_exif_str(raw: str) -> str | None:
         return None
 
 
-def _read_sidecar_ts(sidecar: Path) -> str | None:
-    """Return photoTakenTime converted to ACCOUNT_TZ, naive (no "Z"/offset) —
-    matching EXIF's format so every local_timestamp is directly comparable to
-    what Google Photos displays, regardless of source."""
-    try:
-        with open(sidecar) as f:
-            data = json.load(f)
-        ts_str = data.get("photoTakenTime", {}).get("timestamp")
-        if ts_str:
-            dt = datetime.fromtimestamp(int(ts_str), tz=timezone.utc).astimezone(_ACCOUNT_TZ)
-            return dt.strftime("%Y-%m-%dT%H:%M:%S")
-    except Exception:
-        pass
-    return None
-
-
-_SIDECAR_TITLE_INDEX: dict[Path, dict[str, Path]] = {}
-
-
-def _sidecar_dir_index(directory: Path) -> dict[str, Path]:
-    """Map {lowercase original filename: sidecar path} for one directory.
-
-    Takeout truncates ".supplemental-metadata.json" when the combined path
-    would exceed its length limit (e.g. "...jpg.supplemental-metada.json"),
-    so filename-guessing misses those. Every sidecar's JSON body still carries
-    the untruncated original filename in "title", so scan once per directory
-    and index by that instead.
-    """
-    if directory in _SIDECAR_TITLE_INDEX:
-        return _SIDECAR_TITLE_INDEX[directory]
-    index: dict[str, Path] = {}
-    for jf in directory.glob("*.json"):
-        try:
-            with open(jf) as f:
-                data = json.load(f)
-            title = data.get("title")
-            if title:
-                index[title.lower()] = jf
-        except Exception:
-            continue
-    _SIDECAR_TITLE_INDEX[directory] = index
-    return index
-
-
 def _sidecar_timestamp(path: Path) -> str | None:
     """Return photoTakenTime from a Takeout JSON sidecar, converted to
-    ACCOUNT_TZ and naive (see _read_sidecar_ts), or None.
+    ACCOUNT_TZ and naive, or None. See sidecars.py for the lookup logic
+    (shared with the `reorganize` and `exif-backfill` commands) and
+    sidecars.read_sidecar_ts for the conversion (see its docstring).
 
     Takeout places sidecar files alongside the media file, using either
     "photo.jpg.json" or (for long filenames) "photo.json" — or, when the
@@ -156,13 +110,13 @@ def _sidecar_timestamp(path: Path) -> str | None:
     """
     for sidecar in (path.with_name(path.name + ".json"), path.with_suffix(".json")):
         if sidecar.exists():
-            ts = _read_sidecar_ts(sidecar)
+            ts = sidecars.read_sidecar_ts(sidecar)
             if ts:
                 return ts
 
-    sidecar = _sidecar_dir_index(path.parent).get(path.name.lower())
+    sidecar = sidecars.sidecar_dir_index(path.parent).get(path.name.lower())
     if sidecar:
-        return _read_sidecar_ts(sidecar)
+        return sidecars.read_sidecar_ts(sidecar)
 
     # Takeout exports an in-app-edited photo as "<name>-edited.<ext>" but never
     # writes a sidecar for it — only the original "<name>.<ext>" gets one. The

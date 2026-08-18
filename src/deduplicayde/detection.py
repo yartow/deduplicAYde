@@ -2,7 +2,6 @@
 
 Returns a DetectionResult for each image file.
 """
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,9 +10,9 @@ import cv2
 import numpy as np
 import pytesseract
 
-_BLUR_THRESHOLD = float(os.environ.get("BLUR_THRESHOLD", "100"))
-_EDGE_THRESHOLD = float(os.environ.get("EDGE_THRESHOLD", "0.05"))
-_OCR_DENSITY_THRESHOLD = float(os.environ.get("OCR_DENSITY_THRESHOLD", "0.001"))
+from .thresholds import BLUR_THRESHOLD as _BLUR_THRESHOLD
+from .thresholds import EDGE_THRESHOLD as _EDGE_THRESHOLD
+from .thresholds import OCR_DENSITY_THRESHOLD as _OCR_DENSITY_THRESHOLD
 
 _RECEIPT_KEYWORDS = re.compile(
     r"\b(total|subtotal|tax|receipt|invoice|amount|cash|change|payment|"
@@ -112,13 +111,15 @@ def _classify(
     edge_density: float,
     ocr_text_density: float,
     is_receipt_text: bool,
+    blur_threshold: float = _BLUR_THRESHOLD,
+    edge_threshold: float = _EDGE_THRESHOLD,
 ) -> str:
     # Receipt: high text density OR strong keyword match
     if ocr_text_density > _OCR_DENSITY_THRESHOLD or is_receipt_text:
         return "receipt"
 
     # Vague: blurry AND low visual content
-    if blur_score < _BLUR_THRESHOLD and edge_density < _EDGE_THRESHOLD:
+    if blur_score < blur_threshold and edge_density < edge_threshold:
         return "vague"
 
     return "ok"

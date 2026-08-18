@@ -118,6 +118,102 @@ and `delete` commands require the Playwright-capable `delete` service (watch
 progress at `http://localhost:6080/vnc.html`) — their DOM selectors are
 best-effort and should be validated against a small test album first.
 
+## AI quality scoring (optional)
+
+Round 1/2's `blur_score` (OpenCV Laplacian variance) is computed over the
+*whole frame*, not the subject — a genuinely sharp close-up against a plain
+background can score as blurry (a big flat region drags the frame-average
+down), and a genuinely blurry photo against a busy background can score as
+sharp (background clutter inflates the average). Threshold-tuning
+(`vague-threshold`, the `/vague` review page) can't fix this — it's a
+metric-shape problem, not a cutoff problem.
+
+`quality-score` runs a real no-reference AI image-quality model
+([pyiqa](https://github.com/chaofengc/IQA-PyTorch)) as a second signal,
+stored alongside `blur_score` rather than replacing it. Two tiers:
+
+| Tier | Model | Notes |
+|---|---|---|
+| `medium` | `musiq` | Fast, moderate size, good default. |
+| `heavyweight` | `clipiqa+_vitL14_512` | Full CLIP ViT-L/14 backbone, slower, first run downloads a ~1-2GB checkpoint. |
+
+**Docker vs. native.** Set in `.env`:
+```
+QUALITY_SCORING_DOCKER=true    # default: CPU-only, works everywhere
+QUALITY_SCORING_DOCKER=false   # native on this Mac, uses PyTorch's `mps`
+                                # backend (Apple GPU) — much faster
+```
+Docker Desktop on Apple Silicon runs containers in a Linux VM with no
+Metal/Neural-Engine passthrough, so the Docker path is always CPU-only
+regardless of model choice. Native execution is the only way to get real GPU
+throughput on an M1/M2/M3/M4 Mac — see `CLAUDE.md` for why this is the one
+deliberate exception to this project's otherwise-strict "nothing on the
+host" rule.
+
+**⚠️ Any CPU-bound run (the Docker path, or native without `mps`) sustains
+real load across multiple cores for the whole run.** Keep the lid open and
+the laptop on a hard, ventilated surface until it finishes — don't put it in
+a bag or close the lid. The `quality` Docker service is capped (`cpus: 4`,
+`mem_limit: 6g` in `docker-compose.yml`) and thread counts are capped in
+code (`QUALITY_MAX_CPU_THREADS`, default: all cores minus 2) after a run
+without those caps coincided with a real overheat/crash — but capped still
+means sustained real load, not safe to leave unattended and enclosed.
+
+**Confirmation prompt.** Any run that can't use the GPU (the Docker path,
+`--device cpu`, or native without `mps` available) prints exactly why and
+asks you to confirm before it starts:
+```
+[!] This application cannot use your GPU because <reason>.
+    It will run on CPU instead — capped to N thread(s), leaving M core(s)
+    free for the terminal/other work — but it will still sustain real CPU
+    load for the whole run.
+    Keep the lid open and don't put the laptop away until it finishes.
+    To stop at any time: Ctrl+C in this terminal, or from another
+    terminal: <kill command>
+    Continue on CPU? [y/N]
+```
+Pass `--yes`/`-y` to skip the prompt for scripted/unattended use — it's
+otherwise required whenever stdin isn't an interactive terminal. Runs on
+`mps` (GPU) skip the prompt (no CPU-pinning risk) but still print the Ctrl+C/
+kill-command reminder.
+
+**Stopping a run.** Ctrl+C in the terminal always works and is caught
+cleanly: full (non-`--sample`) runs checkpoint each item as it's scored, so
+an interrupt loses at most the one in-flight image — just re-run the same
+command to resume. Sample runs write no DB changes regardless. If the
+terminal itself is unresponsive, kill it from another terminal:
+```
+docker compose kill quality                        # Docker path
+pkill -f "deduplicayde.cli quality-score"           # native path
+```
+The process also runs at lowered scheduling priority (`nice`d) so the OS
+favors the terminal and other apps over it whenever CPU is contested.
+
+**One-time native setup** (skip if staying on the Docker default):
+```
+./scripts/setup_quality_native_env.sh
+```
+Creates `.venv-quality/` (gitignored) and installs PyTorch + pyiqa there —
+fully isolated from the Dockerized services, targets whatever Python 3.13/
+3.14 is available on the host since the container's Python 3.12 image isn't
+used for this step.
+
+**Try before you commit.** Always invoke via the dispatcher script, which
+reads `QUALITY_SCORING_DOCKER` and routes to the right place automatically:
+```
+./scripts/run_quality_score.sh --sample 20 --tier medium
+```
+Scores a random sample of 20 unscored images, writes **zero** database
+changes, and opens a self-contained HTML report (thumbnails, scores, timing,
+an extrapolated full-run estimate) so you can eyeball whether the tier's
+results look right before spending real time on the full library. Try
+`--tier heavyweight` the same way and compare. Once you're happy:
+```
+./scripts/run_quality_score.sh --tier heavyweight
+```
+runs the full pass (no `--sample`), checkpointed/resumable like every other
+round, writing `quality_score`/`quality_model`/`quality_scored_at` per item.
+
 ## Status / progress
 
 ```

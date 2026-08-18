@@ -6,10 +6,14 @@ Commands:
   auth                   Authenticate with Google Photos API (run once, opens port 8080)
   login                  One-time: log into Google in a plain browser window (use delete service)
   round0                 Catalog local files (filename, EXIF/sidecar timestamp, path)
+  reorganize             Sort library/ into yyyy-mm-dd date folders (EXIF-first, sidecar fallback)
+  exif-backfill          Fill missing EXIF DateTimeOriginal/GPS from sidecars, for Lightroom import
   round1                 Detect receipts/vague (first half of library)
   round2                 Detect receipts/vague (second half)
   round3                 Locally delete files whose cloud copy was trashed
   round4                 Compute phashes, find duplicate pairs
+  vague-threshold        Preview/apply a different blur/edge cutoff for 'vague', reusing stored scores
+  quality-score          AI no-reference image-quality scoring (native or Docker; use scripts/run_quality_score.sh)
   stage --purpose=...    Locate detected items on photos.google.com, add to review album (use delete service)
   detect-short-videos    Find ≤3s videos: stage for cloud deletion, delete locally
   purge-local-videos     Delete all video files locally (Google Photos copies kept)
@@ -45,6 +49,24 @@ def cmd_round0(args) -> None:
     round0.run(limit=args.limit)
 
 
+def cmd_reorganize(args) -> None:
+    from . import reorganize
+    try:
+        reorganize.run(dry_run=args.dry_run, limit=args.limit)
+    except reorganize._AlreadyRunningError as e:
+        print(f"\nError: {e}")
+        raise SystemExit(1)
+
+
+def cmd_exif_backfill(args) -> None:
+    from . import exif_backfill
+    try:
+        exif_backfill.run(dry_run=args.dry_run, limit=args.limit)
+    except exif_backfill._AlreadyRunningError as e:
+        print(f"\nError: {e}")
+        raise SystemExit(1)
+
+
 def cmd_round1(_args) -> None:
     from . import round1_2
     round1_2.run(half=1)
@@ -63,6 +85,23 @@ def cmd_round3(args) -> None:
 def cmd_round4(args) -> None:
     from . import round4
     round4.run(threshold=args.threshold)
+
+
+def cmd_vague_threshold(args) -> None:
+    from . import vague_threshold
+    vague_threshold.run(
+        blur_threshold=args.blur_threshold,
+        edge_threshold=args.edge_threshold,
+        apply_changes=args.apply,
+    )
+
+
+def cmd_quality_score(args) -> None:
+    from . import quality_score
+    quality_score.run(
+        tier=args.tier, device=args.device, sample_n=args.sample, seed=args.seed,
+        assume_yes=args.yes,
+    )
 
 
 def cmd_detect_short_videos(args) -> None:
@@ -169,6 +208,24 @@ def main() -> None:
     p0 = sub.add_parser("round0", help="Catalog local files (filename, EXIF/sidecar timestamp, path)")
     p0.add_argument("--limit", type=int, default=None, help="Stop after N files (testing)")
 
+    # reorganize
+    pr = sub.add_parser(
+        "reorganize",
+        help="Sort library/ into yyyy-mm-dd date folders (EXIF-first, sidecar fallback; see reorganize.py)",
+    )
+    pr.add_argument("--dry-run", action="store_true", default=True)
+    pr.add_argument("--no-dry-run", dest="dry_run", action="store_false")
+    pr.add_argument("--limit", type=int, default=None, help="Stop after N files (testing)")
+
+    # exif-backfill
+    peb = sub.add_parser(
+        "exif-backfill",
+        help="Fill missing EXIF DateTimeOriginal/GPS from sidecars via exiftool (run after reorganize)",
+    )
+    peb.add_argument("--dry-run", action="store_true", default=True)
+    peb.add_argument("--no-dry-run", dest="dry_run", action="store_false")
+    peb.add_argument("--limit", type=int, default=None, help="Stop scanning after N candidate files (testing)")
+
     # round1
     p1 = sub.add_parser("round1", help="Detect items (first half)")
 
@@ -184,6 +241,38 @@ def main() -> None:
     p4 = sub.add_parser("round4", help="Compute phashes and find duplicate pairs")
     p4.add_argument("--threshold", type=int, default=None,
                     help="Hamming distance threshold (default: PHASH_HAMMING_THRESHOLD env or 10)")
+
+    # vague-threshold
+    pvt = sub.add_parser(
+        "vague-threshold",
+        help="Preview/apply a different blur/edge cutoff for the 'vague' label, reusing stored scores (no re-detection)",
+    )
+    pvt.add_argument("--blur-threshold", type=float, default=None,
+                     help="Laplacian variance cutoff, lower = stricter (default: BLUR_THRESHOLD env or 100)")
+    pvt.add_argument("--edge-threshold", type=float, default=None,
+                     help="Edge density cutoff, lower = stricter (default: EDGE_THRESHOLD env or 0.05)")
+    pvt.add_argument("--apply", action="store_true", default=False,
+                     help="Persist the new labels (default: preview-only, no writes)")
+
+    # quality-score
+    pqs = sub.add_parser(
+        "quality-score",
+        help="AI no-reference image-quality scoring (native or Docker per "
+             "QUALITY_SCORING_DOCKER; invoke via scripts/run_quality_score.sh)",
+    )
+    pqs.add_argument("--tier", choices=["medium", "heavyweight"], default=None,
+                     help="Model tier (default: QUALITY_TIER env or 'medium')")
+    pqs.add_argument("--sample", type=int, default=None, metavar="N",
+                     help="Trial mode: score a random sample of N eligible images, "
+                          "write an HTML report to DATA_DIR/logs/, no DB writes. "
+                          "Omit for a full run over all unscored items.")
+    pqs.add_argument("--device", choices=["auto", "mps", "cpu"], default="auto",
+                     help="Inference device (default: auto-detect MPS, fall back to CPU)")
+    pqs.add_argument("--seed", type=int, default=None,
+                     help="Random seed for --sample reproducibility")
+    pqs.add_argument("--yes", "-y", action="store_true", default=False,
+                     help="Skip the confirmation prompt shown before any CPU-bound "
+                          "(no-GPU) run. Required if stdin isn't a TTY (e.g. scripted).")
 
     # detect-short-videos
     pdsv = sub.add_parser(
@@ -233,10 +322,14 @@ def main() -> None:
         "auth": cmd_auth,
         "login": cmd_login,
         "round0": cmd_round0,
+        "reorganize": cmd_reorganize,
+        "exif-backfill": cmd_exif_backfill,
         "round1": cmd_round1,
         "round2": cmd_round2,
         "round3": cmd_round3,
         "round4": cmd_round4,
+        "vague-threshold": cmd_vague_threshold,
+        "quality-score": cmd_quality_score,
         "detect-short-videos": cmd_detect_short_videos,
         "purge-local-videos": cmd_purge_local_videos,
         "delete": cmd_delete,

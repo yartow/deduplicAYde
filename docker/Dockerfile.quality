@@ -1,0 +1,19 @@
+FROM python:3.12-slim
+
+# CPU-only fallback path for quality-score (QUALITY_SCORING_DOCKER=true, the
+# default). No GPU/ANE passthrough exists in Docker Desktop on Apple Silicon
+# — see CLAUDE.md — so this exists for portability, not speed. Prefer
+# scripts/setup_quality_native_env.sh + QUALITY_SCORING_DOCKER=false on an
+# Apple Silicon Mac for real throughput.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements/quality.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/ /app/
+
+ENV PYTHONPATH=/app
